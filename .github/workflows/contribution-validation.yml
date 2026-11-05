@@ -1,0 +1,40 @@
+name: Upstream contribution validation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: contribution-validation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    if: github.repository == 'xzq-xu/ServerS5A3'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOMAXPROCS: '2'
+      GOFLAGS: '-p=2'
+      CONTRIBUTION_SOURCE: c018c96129cb8036b73bd643384f97201e28e481
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go-server/go.mod
+          cache-dependency-path: go-server/go.sum
+      - name: Verify exact contribution source
+        run: |
+          git diff --exit-code "$CONTRIBUTION_SOURCE"..HEAD -- . ':(exclude).github/workflows/contribution-validation.yml'
+          git diff --check 57649634e21427bfeb717266b7aa38685f1659ae.."$CONTRIBUTION_SOURCE"
+      # Upstream's existing change-note formatting failure is reported on the
+      # PR. This manual fork run validates the unchanged code/test input only.
+      - name: Complete domain, bridge, control and vet regression
+        run: sh scripts/ci/test_core.sh
+      - name: Linux amd64 server build
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: go -C go-server build -buildvcs=false -mod=readonly -o ../runtime/bin/DNF90Server-contribution-check ./cmd/server/dnf90
