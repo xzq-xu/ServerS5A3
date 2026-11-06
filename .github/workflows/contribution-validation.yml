@@ -1,0 +1,38 @@
+name: Upstream contribution validation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: contribution-validation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    if: github.repository == 'xzq-xu/ServerS5A3'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOMAXPROCS: '2'
+      GOFLAGS: '-p=2'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go-server/go.mod
+          cache-dependency-path: go-server/go.sum
+      - name: Check isolated public contribution diff
+        run: |
+          test "$(git rev-parse HEAD^)" = "2798975e8a415fc296f6f068cbf8e507409ed88a"
+          git diff --check a1f700a893d99f54ccbbd4ceac68958b1a78fd4e..HEAD
+          python3 scripts/ci/changelog_fragments.py check --base a1f700a893d99f54ccbbd4ceac68958b1a78fd4e
+      - name: Complete domain, bridge, control and vet regression
+        run: sh scripts/ci/test_core.sh
+      - name: Linux amd64 server build
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: go -C go-server build -buildvcs=false -mod=readonly -o ../runtime/bin/DNF90Server-contribution-check ./cmd/server/dnf90
