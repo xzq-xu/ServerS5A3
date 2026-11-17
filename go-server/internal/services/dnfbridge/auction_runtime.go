@@ -50,6 +50,10 @@ const (
 	// the send: the opening bid becomes -1 when it is 0 or equal to the buyout,
 	// and the buyout becomes -1 when it is 0.
 	currentAuctionPriceAbsent = int64(-1)
+	// The auction client requests 60-record batches. Its list window shows ten
+	// records per page and requests the next batch on the first page after the
+	// loaded batch is exhausted.
+	currentAuctionSearchBatchSize = 60
 )
 
 // Client-visible auction failure codes, read straight off the auction panel's
@@ -214,6 +218,8 @@ func decodeCurrentAuctionRegisterRequest(body []byte) (currentAuctionRegisterReq
 	// account-scoped crystal/soul warehouse, which is how a seller lists
 	// 无色小晶块 and the rest of the cube family: this server keeps those slots
 	// account-owned, and the client therefore never sends them as container 0.
+	// Container 7 is accepted only for the pet-artifact segment (140..188);
+	// the authoritative PVF family is checked again before escrow registration.
 	// Any other value names a container this server cannot debit and stays
 	// refused.
 	if len(body) != currentAuctionRegisterRequestSize || body[0] != currentAuctionPayTypeGold {
@@ -226,6 +232,10 @@ func decodeCurrentAuctionRegisterRequest(body []byte) (currentAuctionRegisterReq
 	accountOwned := false
 	switch body[1] {
 	case currentExeInventoryMainListType:
+	case currentPetInventoryListType:
+		if rawSlot < uint16(currentPVFPetArtifactSlotStart) || rawSlot > uint16(currentPVFPetArtifactSlotEnd) {
+			return currentAuctionRegisterRequest{}, dnfauction.ErrInvalidRequest
+		}
 	case currentAuctionAccountContainerByte:
 		if !dnfrepo.IsAccountSharedInventorySlot(
 			dnfrepo.MainInventoryListType, int16(rawSlot)) {
@@ -237,7 +247,7 @@ func decodeCurrentAuctionRegisterRequest(body []byte) (currentAuctionRegisterReq
 	}
 	request := currentAuctionRegisterRequest{
 		PayType:       body[0],
-		ListType:      currentExeInventoryMainListType,
+		ListType:      body[1],
 		AccountOwned:  accountOwned,
 		Slot:          int16(rawSlot),
 		ItemID:        int64(binary.LittleEndian.Uint32(body[4:8])),
@@ -246,6 +256,9 @@ func decodeCurrentAuctionRegisterRequest(body []byte) (currentAuctionRegisterReq
 		InstantPrice:  int64(int32(binary.LittleEndian.Uint32(body[16:20]))),
 		UnitPrice:     int64(int32(binary.LittleEndian.Uint32(body[20:24]))),
 		DurationHours: binary.LittleEndian.Uint32(body[24:28]),
+	}
+	if accountOwned {
+		request.ListType = currentExeInventoryMainListType
 	}
 	// Bytes 28..36 are the client's random-option summary, not reserved zeros.
 	// The native sender writes {30000,0} three times for unidentified magic
@@ -344,44 +357,48 @@ func (s *Service) handleCurrentAuctionCommand(session *gameSession, opcode uint1
 	if session == nil || session.selectedCharacterID == 0 {
 		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
 	}
+	if isCurrentAuctionReadCommand(opcode) {
+		response := s.prepareCurrentAuctionReadCommand(session, opcode, body)
+		return response.send(s, session)
+	}
+	if experimentalPeakEnabled() && (len(body) == 0 || body[0] != currentAuctionPayTypeConsignment) {
+		batch := &currentAuctionMutationBatch{}
+		err := func() error {
+			s.auctionMu.Lock()
+			defer s.auctionMu.Unlock()
+			defer s.scheduleCurrentAuctionMaintenanceLocked(30 * time.Second)
+			return s.prepareCurrentAuctionMutationLocked(session, opcode, body, batch)
+		}()
+		if err != nil {
+			return err
+		}
+		return batch.send(s, session)
+	}
 	s.auctionMu.Lock()
 	defer s.auctionMu.Unlock()
 	defer s.scheduleCurrentAuctionMaintenanceLocked(30 * time.Second)
-	// Settling won listings before anything else is what makes bidding work
-	// without a scheduler: the sweep is seller- and bidder-agnostic, so any
-	// auction request from anybody closes every listing whose duration ran out
-	// under a standing bid. 86JP drives the same transition from a clock; this
-	// tree has no auction clock, and an expired listing has to stop being
-	// biddable and start being deliverable the moment somebody looks.
-	s.settleCurrentAuctionWonListingsLocked(session)
-	s.retryCurrentAuctionMailsLocked(session)
+	// The persistent clock owns expiry and outbox recovery. Read requests must
+	// not perform a full-market write sweep before their own lookup; Buy/Bid
+	// still validate expiry inside the authoritative asset transaction.
 
 	if len(body) > 0 && body[0] == currentAuctionPayTypeConsignment {
 		return s.handleCurrentGoldConsignLocked(session, opcode, body)
 	}
+	return s.prepareCurrentAuctionMutationLocked(session, opcode, body, nil)
+}
+
+func (s *Service) prepareCurrentAuctionMutationLocked(session *gameSession, opcode uint16, body []byte, batch *currentAuctionMutationBatch) error {
 	switch opcode {
 	case uint16(dnfenum.CmdPacketAuctionRegistItem):
-		return s.registerCurrentAuctionItemLocked(session, body)
+		return s.registerCurrentAuctionItemLocked(session, body, batch)
 	case uint16(dnfenum.CmdPacketAuctionRegistCancel):
-		return s.cancelCurrentAuctionItemLocked(session, body)
+		return s.cancelCurrentAuctionItemLocked(session, body, batch)
 	case uint16(dnfenum.CmdPacketAuctionBidding):
-		return s.buyCurrentAuctionItemLocked(session, opcode, body, false)
+		return s.buyCurrentAuctionItemLocked(session, opcode, body, false, batch)
 	case uint16(dnfenum.CmdPacketAuctionBuyItemApiece):
-		return s.buyCurrentAuctionItemLocked(session, opcode, body, true)
-	case uint16(dnfenum.CmdPacketAuctionSearchByItemkey):
-		s.rememberCurrentAuctionSearchLocked(session, opcode, body)
-		return s.searchCurrentAuctionItemsLocked(session, body)
-	case uint16(dnfenum.CmdPacketAuctionSearchByNoitemkey):
-		s.rememberCurrentAuctionSearchLocked(session, opcode, body)
-		return s.searchCurrentAuctionCategoryLocked(session, body)
-	case uint16(dnfenum.CmdPacketAuctionAskAveragePrice):
-		return s.sendCurrentAuctionAveragePriceLocked(session, body)
-	case uint16(dnfenum.CmdPacketAuctionMyRegistedItemInfo):
-		return s.sendCurrentAuctionOwnedItemsLocked(session, body)
-	case uint16(dnfenum.CmdPacketAuctionMyBiddingInfo):
-		return s.sendCurrentAuctionBiddingItemsLocked(session, body)
+		return s.buyCurrentAuctionItemLocked(session, opcode, body, true, batch)
 	default:
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return batch.failure(s, session, opcode, currentAuctionFailureCode)
 	}
 }
 
@@ -456,11 +473,12 @@ func (s *Service) currentAuctionSourceSlots(
 	return account.Slots, nil
 }
 
-func (s *Service) registerCurrentAuctionItemLocked(session *gameSession, body []byte) error {
+func (s *Service) registerCurrentAuctionItemLocked(session *gameSession, body []byte, replies ...*currentAuctionMutationBatch) error {
+	batch := currentAuctionMutationReplies(replies)
 	opcode := uint16(dnfenum.CmdPacketAuctionRegistItem)
 	// 金币寄售属于独立点券交易，本物品拍卖入口不接受 mode=1。
 	if len(body) > 0 && body[0] == currentAuctionPayTypeConsignment {
-		return s.sendGameUpperRawClass(session, opcode, []byte{0, currentAuctionFailureCode, 1}, 1)
+		return batch.raw(s, session, opcode, []byte{0, currentAuctionFailureCode, 1}, 1)
 	}
 	var request currentAuctionRegisterRequest
 	reject := func(stage string, cause error) error {
@@ -494,14 +512,14 @@ func (s *Service) registerCurrentAuctionItemLocked(session *gameSession, body []
 		rejected["duration_hours"] = request.DurationHours
 		rejected["client_code"] = code
 		s.recordAuction(session, "list", rejected)
-		return s.sendGameUpperFailure(session, opcode, code)
+		return batch.failure(s, session, opcode, code)
 	}
 	var err error
 	request, err = decodeCurrentAuctionRegisterRequest(body)
 	if err != nil {
 		return reject("decode", err)
 	}
-	const listType = byte(0)
+	listType := request.ListType
 	slot := request.Slot
 	itemID := request.ItemID
 	requestedCount := request.Count
@@ -535,6 +553,16 @@ func (s *Service) registerCurrentAuctionItemLocked(session *gameSession, body []
 	// there. The client has its own text for a lock, so name it.
 	if currentDungeonDiscardStackLocked(stack) {
 		return reject("item_locked", dnfauction.ErrItemUnavailable)
+	}
+	if listType == currentPetInventoryListType {
+		catalog, lookupErr := s.currentPVFItemCatalog()
+		if lookupErr != nil || catalog == nil {
+			return reject("pet_catalog", dnfauction.ErrItemUnavailable)
+		}
+		definition, lookupErr := catalog.ResolveItem(uint32(itemID))
+		if lookupErr != nil || !currentPVFItemTargetContainer(definition).PetArtifact {
+			return reject("pet_family", dnfauction.ErrItemUnavailable)
+		}
 	}
 	expectedBind, allowSealed, eligible := s.currentAuctionRegistrationPolicy(uint32(itemID), stack)
 	if !eligible {
@@ -597,15 +625,15 @@ func (s *Service) registerCurrentAuctionItemLocked(session *gameSession, body []
 		"fee_percent", feePercent,
 		"gold_after", result.GoldAfter,
 		"duration_hours", request.DurationHours)
-	if err := s.sendGameUpperSuccess(session, opcode, buildCurrentAuctionRegisterSuccessBody(result.Listing.ID, false)); err != nil {
+	if err := batch.success(s, session, opcode, buildCurrentAuctionRegisterSuccessBody(result.Listing.ID, false)); err != nil {
 		return err
 	}
-	if err := s.sendCurrentAuctionInventorySlot(session, listType, slot, result.Inventory); err != nil {
+	if err := s.sendCurrentAuctionInventorySlot(session, listType, slot, result.Inventory, batch); err != nil {
 		return err
 	}
 	// The deposit left the wallet inside the same transaction, so the gold row
 	// has to be republished or the client keeps showing the pre-listing total.
-	if err := s.sendGameUpperRawClass(session, 14, buildCurrentGoldStateBody(result.GoldAfter), 0); err != nil {
+	if err := batch.raw(s, session, 14, buildCurrentGoldStateBody(result.GoldAfter), 0); err != nil {
 		return err
 	}
 	// 上架记录：一次成功的上架就是一次状态跃迁（物品离开背包、托管押金被扣、
@@ -665,7 +693,8 @@ func (s *Service) currentAuctionEntitlementLocked(ctx context.Context, session *
 	return currentAuctionStandardListingLimit, currentAuctionStandardDuration, dnfauction.SaleFeePercentFor(false)
 }
 
-func (s *Service) cancelCurrentAuctionItemLocked(session *gameSession, body []byte) error {
+func (s *Service) cancelCurrentAuctionItemLocked(session *gameSession, body []byte, replies ...*currentAuctionMutationBatch) error {
+	batch := currentAuctionMutationReplies(replies)
 	opcode := uint16(dnfenum.CmdPacketAuctionRegistCancel)
 	// 金币寄售 cancels on the same opcode and, on the item panel's own shape,
 	// with a 9-byte mode-1 body ({u8 mode, i64 listingId}). INFERRED: listing
@@ -673,20 +702,20 @@ func (s *Service) cancelCurrentAuctionItemLocked(session *gameSession, body []by
 	// captured. See the gold protocol file.
 	if len(body) == 9 &&
 		body[0] == currentAuctionPayTypeConsignment {
-		return s.sendGameUpperRawClass(session, opcode, []byte{0, currentAuctionFailureCode, 1}, 1)
+		return batch.raw(s, session, opcode, []byte{0, currentAuctionFailureCode, 1}, 1)
 	}
 	if len(body) != 9 || body[0] != currentAuctionPayTypeGold {
 		rejected := activityRejectionFields("malformed_body")
 		rejected["body_len"] = len(body)
 		s.recordAuction(session, "cancel", rejected)
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return batch.failure(s, session, opcode, currentAuctionFailureCode)
 	}
 	owner, err := s.currentAuctionOwner()
 	if err != nil {
 		rejected := activityRejectionFields("auction_unavailable")
 		rejected["body_len"] = len(body)
 		s.recordAuction(session, "cancel", rejected)
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return batch.failure(s, session, opcode, currentAuctionFailureCode)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
 	defer cancel()
@@ -710,7 +739,7 @@ func (s *Service) cancelCurrentAuctionItemLocked(session *gameSession, body []by
 		rejected["listing_id"] = listingID
 		rejected["client_code"] = code
 		s.recordAuction(session, "cancel", rejected)
-		return s.sendGameUpperFailure(session, opcode, code)
+		return batch.failure(s, session, opcode, code)
 	}
 	// The ACK goes out before the return mail. That is the order every other
 	// command uses - and what the gold consignment cancel already does: the
@@ -720,7 +749,7 @@ func (s *Service) cancelCurrentAuctionItemLocked(session *gameSession, body []by
 	// would also leave the 60091 banner racing an outstanding op184 request,
 	// which the class-1 dispatcher is free to consume as part of the pending
 	// transition.
-	if err := s.sendGameUpperSuccess(session, opcode, []byte{currentAuctionPayTypeGold}); err != nil {
+	if err := batch.success(s, session, opcode, []byte{currentAuctionPayTypeGold}); err != nil {
 		return err
 	}
 	if result.Delivery.ID != "" {
@@ -788,16 +817,17 @@ func (s *Service) rememberCurrentAuctionSearchLocked(session *gameSession, opcod
 // dispatcher at 0x225C8A0 gates class-1 packets on one global transition flag,
 // not on a per-request pending table, so an unsolicited one dispatches exactly
 // like the player's own search.
-func (s *Service) replayCurrentAuctionSearchLocked(session *gameSession) error {
+func (s *Service) replayCurrentAuctionSearchLocked(session *gameSession, replies ...*currentAuctionMutationBatch) error {
+	batch := currentAuctionMutationReplies(replies)
 	if session == nil || len(session.auctionLastSearchBody) == 0 {
 		return nil
 	}
 	body := append([]byte(nil), session.auctionLastSearchBody...)
 	switch session.auctionLastSearchOpcode {
 	case uint16(dnfenum.CmdPacketAuctionSearchByItemkey):
-		return s.searchCurrentAuctionItemsLocked(session, body)
+		return batch.response(s, session, s.prepareCurrentAuctionItemsLocked(session, body))
 	case uint16(dnfenum.CmdPacketAuctionSearchByNoitemkey):
-		return s.searchCurrentAuctionCategoryLocked(session, body)
+		return batch.response(s, session, s.prepareCurrentAuctionCategoryLocked(session, body))
 	default:
 		return nil
 	}
@@ -822,7 +852,8 @@ func (s *Service) currentAuctionAmountIsBid(ctx context.Context, owner *dnfaucti
 // buyout does: the client's success branch only refreshes the panel and toasts
 // 已完成竞拍, so a recorded bid and a completed buyout look alike to it. The
 // bidder's gold left their wallet, so the wallet row has to be republished.
-func (s *Service) bidCurrentAuctionItemLocked(ctx context.Context, session *gameSession, opcode uint16, owner *dnfauction.Owner, listingID uint64, expectedItemID, money int64) error {
+func (s *Service) bidCurrentAuctionItemLocked(ctx context.Context, session *gameSession, opcode uint16, owner *dnfauction.Owner, listingID uint64, expectedItemID, money int64, replies ...*currentAuctionMutationBatch) error {
+	batch := currentAuctionMutationReplies(replies)
 	result, err := owner.Bid(ctx, dnfauction.BidCommand{
 		BidderID: selectedCharacterIDString(session), AccountID: strings.TrimSpace(s.accountIDForSession(session)),
 		ListingID: listingID, ExpectedItemID: expectedItemID, Money: money,
@@ -838,7 +869,7 @@ func (s *Service) bidCurrentAuctionItemLocked(ctx context.Context, session *game
 		rejected["bid_total"] = money
 		rejected["client_code"] = code
 		s.recordAuction(session, "bid", rejected)
-		return s.sendGameUpperFailure(session, opcode, code)
+		return batch.failure(s, session, opcode, code)
 	}
 	// The outbid player's gold is already parked in the durable refund row, so
 	// a failure here defers the payment instead of losing it.
@@ -854,10 +885,10 @@ func (s *Service) bidCurrentAuctionItemLocked(ctx context.Context, session *game
 		"item_id", expectedItemID, "bid_total", money,
 		"outbid_id", result.Refund.SellerID, "outbid_gold", result.Refund.Gold,
 		"gold_after", result.GoldAfter)
-	if err := s.sendGameUpperSuccess(session, opcode, []byte{currentAuctionPayTypeGold}); err != nil {
+	if err := batch.success(s, session, opcode, []byte{currentAuctionPayTypeGold}); err != nil {
 		return err
 	}
-	if err := s.sendGameUpperRawClass(session, 14, buildCurrentGoldStateBody(result.GoldAfter), 0); err != nil {
+	if err := batch.raw(s, session, 14, buildCurrentGoldStateBody(result.GoldAfter), 0); err != nil {
 		return err
 	}
 	// 出价记录：Bid 成功就是一次跃迁（新竞价写入挂单行、出价方金币进托管、
@@ -897,10 +928,11 @@ func (s *Service) bidCurrentAuctionItemLocked(ctx context.Context, session *game
 	// The client drops the row it just bid on, so hand the list back with the
 	// new current price on it. Without this the panel reads as empty until the
 	// player searches again.
-	return s.replayCurrentAuctionSearchLocked(session)
+	return s.replayCurrentAuctionSearchLocked(session, batch)
 }
 
-func (s *Service) buyCurrentAuctionItemLocked(session *gameSession, opcode uint16, body []byte, apiece bool) error {
+func (s *Service) buyCurrentAuctionItemLocked(session *gameSession, opcode uint16, body []byte, apiece bool, replies ...*currentAuctionMutationBatch) error {
+	batch := currentAuctionMutationReplies(replies)
 	// 金币寄售 buys on op185 with a compact mode-1 body. INFERRED: it has never
 	// been captured, because listing did not work before this change. The item
 	// panel's op185 is 30 bytes and mode 0, so the two cannot collide, and the
@@ -911,7 +943,7 @@ func (s *Service) buyCurrentAuctionItemLocked(session *gameSession, opcode uint1
 	// of op334, if one exists, is still unknown and must stay on the item path
 	// until a capture shows its shape.
 	if !apiece && len(body) > 0 && body[0] == currentAuctionPayTypeConsignment {
-		return s.sendGameUpperRawClass(session, opcode, []byte{0, currentAuctionFailureCode, 1}, 1)
+		return batch.raw(s, session, opcode, []byte{0, currentAuctionFailureCode, 1}, 1)
 	}
 	var money int64
 	var count int64 = 1
@@ -919,7 +951,7 @@ func (s *Service) buyCurrentAuctionItemLocked(session *gameSession, opcode uint1
 	var expectedItemID int64
 	if apiece {
 		if len(body) != 33 {
-			return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+			return batch.failure(s, session, opcode, currentAuctionFailureCode)
 		}
 		money = int64(int32(binary.LittleEndian.Uint32(body[0:4])))
 		count = int64(int32(binary.LittleEndian.Uint32(body[4:8])))
@@ -927,18 +959,18 @@ func (s *Service) buyCurrentAuctionItemLocked(session *gameSession, opcode uint1
 		expectedItemID = int64(binary.LittleEndian.Uint32(body[29:33]))
 	} else {
 		if len(body) != 30 || body[0] != currentAuctionPayTypeGold {
-			return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+			return batch.failure(s, session, opcode, currentAuctionFailureCode)
 		}
 		money = int64(int32(binary.LittleEndian.Uint32(body[1:5])))
 		listingID = binary.LittleEndian.Uint64(body[5:13])
 		expectedItemID = int64(binary.LittleEndian.Uint32(body[26:30]))
 	}
 	if money <= 0 || (apiece && count <= 0) || listingID == 0 || expectedItemID <= 0 {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return batch.failure(s, session, opcode, currentAuctionFailureCode)
 	}
 	owner, err := s.currentAuctionOwner()
 	if err != nil {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return batch.failure(s, session, opcode, currentAuctionFailureCode)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
 	defer cancel()
@@ -948,7 +980,7 @@ func (s *Service) buyCurrentAuctionItemLocked(session *gameSession, opcode uint1
 	// place from the other side (`bidAmount >= InstantPrice` is not a bid).
 	// Only the whole-listing form can bid; op334 is per-piece buyout only.
 	if !apiece && s.currentAuctionAmountIsBid(ctx, owner, listingID, money) {
-		return s.bidCurrentAuctionItemLocked(ctx, session, opcode, owner, listingID, expectedItemID, money)
+		return s.bidCurrentAuctionItemLocked(ctx, session, opcode, owner, listingID, expectedItemID, money, batch)
 	}
 	result, err := owner.Buy(ctx, dnfauction.BuyCommand{
 		BuyerID: selectedCharacterIDString(session), AccountID: strings.TrimSpace(s.accountIDForSession(session)),
@@ -993,7 +1025,7 @@ func (s *Service) buyCurrentAuctionItemLocked(session *gameSession, opcode uint1
 		rejected["whole_listing"] = !apiece
 		rejected["client_code"] = code
 		s.recordAuction(session, "buyout", rejected)
-		return s.sendGameUpperFailure(session, opcode, code)
+		return batch.failure(s, session, opcode, code)
 	}
 	if result.Delivery.ID != "" {
 		if deliveryErr := s.deliverCurrentAuctionBuyerMailLocked(ctx, owner, result.Delivery); deliveryErr != nil {
@@ -1020,10 +1052,10 @@ func (s *Service) buyCurrentAuctionItemLocked(session *gameSession, opcode uint1
 	if !apiece {
 		response.writeByte(currentAuctionPayTypeGold)
 	}
-	if err := s.sendGameUpperSuccess(session, opcode, response.bytes()); err != nil {
+	if err := batch.success(s, session, opcode, response.bytes()); err != nil {
 		return err
 	}
-	if err := s.sendGameUpperRawClass(session, 14, buildCurrentGoldStateBody(result.GoldAfter), 0); err != nil {
+	if err := batch.raw(s, session, 14, buildCurrentGoldStateBody(result.GoldAfter), 0); err != nil {
 		return err
 	}
 	// 一口价成交记录：Buy 成功就是一次跃迁（挂单行被扣、买家金币进托管、
@@ -1108,32 +1140,36 @@ func auctionPayoutRecordFields(s *Service, payout dnfauction.Payout, mailed bool
 }
 
 func (s *Service) searchCurrentAuctionItemsLocked(session *gameSession, body []byte) error {
+	return s.prepareCurrentAuctionItemsLocked(session, body).send(s, session)
+}
+
+func (s *Service) prepareCurrentAuctionItemsLocked(session *gameSession, body []byte) currentAuctionReadResponse {
 	opcode := uint16(dnfenum.CmdPacketAuctionSearchByItemkey)
-	// 金币寄售 shares op186 with the item auction and reuses its page/count/
+	// 金币寄售 shares op186 with the item auction and reuses its offset/count/
 	// itemId layout, but sets mode 1 and omits the 8-byte detail tail. Live
 	// capture 2026-09-21T09:35:47Z, packet_log.txt: op186 body
-	// `0100000000001F01A59C7DEB2800` = mode 1 + page 0 + count 1 +
+	// `0100000000001F01A59C7DEB2800` = mode 1 + offset 0 + count 1 +
 	// category 40101 + item 2681725 (「1百万」), 14 bytes, no tail. Only that
 	// mode byte is diverted, so every item-panel search keeps the path below.
 	if len(body) > 0 && body[0] == currentAuctionPayTypeConsignment {
-		return s.sendGameUpperRawClass(session, opcode, []byte{0, currentAuctionFailureCode, 1}, 1)
+		return currentAuctionReadRaw(opcode, []byte{0, currentAuctionFailureCode, 1}, 1)
 	}
-	page, itemIDs, ok := decodeCurrentAuctionSearchItemIDs(body)
+	offset, itemIDs, ok := decodeCurrentAuctionSearchItemIDs(body)
 	if !ok {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
 	owner, err := s.currentAuctionOwner()
 	if err != nil {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
 	defer cancel()
 	listings, err := owner.Search(ctx, itemIDs)
 	if err != nil {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
-	bodyOut := buildCurrentAuctionSearchBodyPage(listings, s.currentAuctionItemEligible, page, 100)
-	return s.sendGameUpperSuccess(session, opcode, bodyOut)
+	bodyOut := buildCurrentAuctionSearchBodyWindow(listings, s.currentAuctionItemEligible, offset, currentAuctionSearchBatchSize)
+	return currentAuctionReadSuccess(opcode, bodyOut)
 }
 
 // searchCurrentAuctionCategoryLocked answers the 拍卖行 "分类搜索" page: the
@@ -1146,12 +1182,16 @@ func (s *Service) searchCurrentAuctionItemsLocked(session *gameSession, body []b
 // this opcode with mode 1 and is diverted to searchCurrentGoldConsignCategoryLocked
 // before any item-auction parsing happens.
 func (s *Service) searchCurrentAuctionCategoryLocked(session *gameSession, body []byte) error {
+	return s.prepareCurrentAuctionCategoryLocked(session, body).send(s, session)
+}
+
+func (s *Service) prepareCurrentAuctionCategoryLocked(session *gameSession, body []byte) currentAuctionReadResponse {
 	responseOpcode := uint16(dnfenum.CmdPacketAuctionSearchByItemkey)
 	// 金币寄售 has its own 金币分类 request on the same opcode. Its exact body
 	// is uncaptured (see the gold protocol file); only mode 1 is diverted, and
 	// the reply keeps the item panel's convention of answering on op186.
 	if len(body) > 0 && body[0] == currentAuctionPayTypeConsignment {
-		return s.sendGameUpperRawClass(session, responseOpcode, []byte{0, currentAuctionFailureCode, 1}, 1)
+		return currentAuctionReadRaw(responseOpcode, []byte{0, currentAuctionFailureCode, 1}, 1)
 	}
 	// Current NoPack.exe sends a fixed 20-byte category/filter request. Live
 	// captures 2026-09-27 (packet_log.txt, conn game-000168/game-000127): the
@@ -1163,35 +1203,39 @@ func (s *Service) searchCurrentAuctionCategoryLocked(session *gameSession, body 
 	// currentAuctionCategoryEligible; an unknown code keeps the old no-filter
 	// behaviour so a client this build has never seen still gets a list.
 	if len(body) != 20 || body[0] != currentAuctionPayTypeGold {
-		return s.sendGameUpperFailure(session, responseOpcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(responseOpcode, currentAuctionFailureCode)
 	}
-	page := binary.LittleEndian.Uint32(body[1:5])
+	offset := binary.LittleEndian.Uint32(body[1:5])
 	category := currentAuctionCategoryRequestCode(body)
 	owner, err := s.currentAuctionOwner()
 	if err != nil {
-		return s.sendGameUpperFailure(session, responseOpcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(responseOpcode, currentAuctionFailureCode)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
 	defer cancel()
 	listings, err := owner.Search(ctx, nil)
 	if err != nil {
-		return s.sendGameUpperFailure(session, responseOpcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(responseOpcode, currentAuctionFailureCode)
 	}
 	eligible := func(itemID uint32) bool {
 		return s.currentAuctionItemEligible(itemID) && s.currentAuctionCategoryEligible(category, itemID)
 	}
-	bodyOut := buildCurrentAuctionSearchBodyPage(listings, eligible, page, 100)
+	bodyOut := buildCurrentAuctionSearchBodyWindow(listings, eligible, offset, currentAuctionSearchBatchSize)
 	// A code the client sends but this build cannot place is worth a log line: it is
 	// either a newer client tree or a node whose membership rule is still unproven.
 	if _, found := currentAuctionCategoryNodeFor(category); !found {
-		s.logGameEvent(session, "game-auction-category-unmapped", "category", category, "page", page)
+		s.logGameEvent(session, "game-auction-category-unmapped", "category", category, "offset", offset)
 	} else if currentAuctionCategoryIsUnpinned(category) {
-		s.logGameEvent(session, "game-auction-category-unpinned", "category", category, "page", page)
+		s.logGameEvent(session, "game-auction-category-unpinned", "category", category, "offset", offset)
 	}
-	return s.sendGameUpperSuccess(session, responseOpcode, bodyOut)
+	return currentAuctionReadSuccess(responseOpcode, bodyOut)
 }
 
 func (s *Service) sendCurrentAuctionAveragePriceLocked(session *gameSession, body []byte) error {
+	return s.prepareCurrentAuctionAveragePriceLocked(session, body).send(s, session)
+}
+
+func (s *Service) prepareCurrentAuctionAveragePriceLocked(session *gameSession, body []byte) currentAuctionReadResponse {
 	opcode := uint16(dnfenum.CmdPacketAuctionAskAveragePrice)
 	// 金币寄售 shares op182 with the item auction but is a different request
 	// shape: 6 bytes with mode 1, against 8 bytes with mode 0. Only that exact
@@ -1199,26 +1243,26 @@ func (s *Service) sendCurrentAuctionAveragePriceLocked(session *gameSession, bod
 	// still reaches the code below byte for byte.
 	if len(body) == currentAuctionGoldAveragePriceRequestSize &&
 		body[0] == currentAuctionPayTypeConsignment {
-		return s.sendGameUpperRawClass(session, opcode, []byte{0, currentAuctionFailureCode, 1}, 1)
+		return currentAuctionReadRaw(opcode, []byte{0, currentAuctionFailureCode, 1}, 1)
 	}
 	if len(body) != 8 || body[0] != currentAuctionPayTypeGold {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
 	// Live current-client request: pay@0, itemID@1..4, reserved@5..7.
 	// Captures for items 24006 and 10081 both use this exact offset.
 	itemID := binary.LittleEndian.Uint32(body[1:5])
 	if itemID == 0 {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
 	owner, err := s.currentAuctionOwner()
 	if err != nil {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
 	defer cancel()
 	listings, err := owner.Search(ctx, []uint32{itemID})
 	if err != nil {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
 	// The current reader consumes pay + one scalar + an auxiliary count,
 	// followed by SIX unit prices and SIX matching quantities. Those twelve
@@ -1262,7 +1306,7 @@ func (s *Service) sendCurrentAuctionAveragePriceLocked(session *gameSession, bod
 	}
 	// 实际成交均价优先；右侧六档仍显示真实在售报价，不当作历史记录。
 	if settledAverage, samples, err := owner.RecentSaleAverage(ctx, int64(itemID)); err != nil {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	} else if samples > 0 {
 		average = currentAuctionUint32(settledAverage)
 	}
@@ -1277,7 +1321,7 @@ func (s *Service) sendCurrentAuctionAveragePriceLocked(session *gameSession, bod
 	for index := 0; index < currentAuctionPriceLadderSlots; index++ {
 		response.writeUint32(ladder[index].quantity)
 	}
-	return s.sendGameUpperSuccess(session, opcode, response.bytes())
+	return currentAuctionReadSuccess(opcode, response.bytes())
 }
 
 // currentAuctionPriceLadderSlots is how many (unit price, quantity) rungs the
@@ -1371,7 +1415,7 @@ func decodeCurrentAuctionSearchBody(body []byte, mode byte) (uint32, []uint32, b
 	if len(body) < 10 || body[0] != mode {
 		return 0, nil, false
 	}
-	page := binary.LittleEndian.Uint32(body[1:5])
+	offset := binary.LittleEndian.Uint32(body[1:5])
 	count := int(body[7])
 	end := 10 + count*4
 	if count == 0 || end > len(body) || len(body)-end > 8 {
@@ -1384,7 +1428,7 @@ func decodeCurrentAuctionSearchBody(body []byte, mode byte) (uint32, []uint32, b
 			return 0, nil, false
 		}
 	}
-	return page, items, true
+	return offset, items, true
 }
 
 // decodeCurrentAuctionSearchItemIDs is the item-auction entry point for the
@@ -1395,10 +1439,16 @@ func decodeCurrentAuctionSearchItemIDs(body []byte) (uint32, []uint32, bool) {
 }
 
 func buildCurrentAuctionSearchBody(listings []dnfauction.Listing, stackable func(uint32) bool) []byte {
-	return buildCurrentAuctionSearchBodyPage(listings, stackable, 0, math.MaxUint16)
+	return buildCurrentAuctionSearchBodyWindow(listings, stackable, 0, math.MaxUint16)
 }
 
-func buildCurrentAuctionSearchBodyPage(listings []dnfauction.Listing, eligible func(uint32) bool, page uint32, pageSize int) []byte {
+// buildCurrentAuctionSearchBodyWindow applies a record offset, not a page
+// number. Both op186 and op187 carry the absolute zero-based record offset in
+// request body[1:5]. The client loads a batch, displays ten records per page,
+// and sends the next record offset once that batch is exhausted. Multiplying
+// the request value by a server page size skips far beyond a 13-page result
+// set and makes every later batch look empty.
+func buildCurrentAuctionSearchBodyWindow(listings []dnfauction.Listing, eligible func(uint32) bool, offset uint32, limit int) []byte {
 	rows := make([]dnfauction.Listing, 0, len(listings))
 	for _, listing := range listings {
 		if listing.Item.ItemID <= 0 || listing.Item.ItemID > math.MaxUint32 || eligible == nil || !eligible(uint32(listing.Item.ItemID)) {
@@ -1407,15 +1457,15 @@ func buildCurrentAuctionSearchBodyPage(listings []dnfauction.Listing, eligible f
 		rows = append(rows, listing)
 	}
 	total := len(rows)
-	if pageSize <= 0 || pageSize > math.MaxUint16 {
-		pageSize = math.MaxUint16
+	if limit <= 0 || limit > math.MaxUint16 {
+		limit = math.MaxUint16
 	}
-	start64 := uint64(page) * uint64(pageSize)
+	start64 := uint64(offset)
 	if start64 >= uint64(len(rows)) {
 		rows = nil
 	} else {
 		start := int(start64)
-		end := min(len(rows), start+pageSize)
+		end := min(len(rows), start+limit)
 		rows = rows[start:end]
 	}
 	var response packetWriter
@@ -1793,23 +1843,24 @@ func (s *Service) settleCurrentAuctionPayoutLocked(ctx context.Context, owner *d
 		"refund_id", payout.ID, "bidder_id", payout.SellerID, "gold", payout.Gold, "gold_after", goldAfter)
 	// The bidder may be standing in the auction house watching their own
 	// wallet; without this their client keeps the pre-refund number until
-	// something else refreshes it.
+	// something else refreshes it. Queue the refresh on the session event loop;
+	// this function runs under auctionMu and must not wait for the peer. The
+	// event task rereads the authoritative wallet instead of repainting with
+	// this transaction's goldAfter.
 	if characterID, parseErr := strconv.ParseUint(payout.SellerID, 10, 16); parseErr == nil && characterID != 0 {
-		if bidderSession, online := s.onlineGameSession(uint16(characterID)); online {
-			if err := s.sendGameUpperRawClass(bidderSession, 14, buildCurrentGoldStateBody(goldAfter), 0); err != nil {
-				s.logGameEvent(nil, "game-auction-bid-refund-gold-refresh-failed",
-					"bidder_id", payout.SellerID, "error", err)
-			}
+		if err := s.postCommittedCharacterGoldRefresh(uint16(characterID), "game-auction-bid-refund-gold-refresh"); err != nil {
+			s.logGameEvent(nil, "game-auction-bid-refund-gold-refresh-failed",
+				"bidder_id", payout.SellerID, "error", err)
 		}
 	}
 	return nil
 }
 
-// settleCurrentAuctionWonListingsLocked closes every listing that ran out its
+// settleCurrentAuctionWonListingsWithContextLocked closes every listing that ran out its
 // duration with a bid standing on it and sends both halves - the item to the
 // winner, the proceeds to the seller. Neither party has to be online: the rows
 // are durable, so a mail failure only defers the delivery.
-func (s *Service) settleCurrentAuctionWonListingsLocked(session *gameSession) {
+func (s *Service) settleCurrentAuctionWonListingsWithContextLocked(ctx context.Context, session *gameSession) {
 	if s == nil {
 		return
 	}
@@ -1817,8 +1868,6 @@ func (s *Service) settleCurrentAuctionWonListingsLocked(session *gameSession) {
 	if err != nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
-	defer cancel()
 	result, err := owner.SettleWonListings(ctx)
 	if err != nil {
 		s.logGameEvent(session, "game-auction-bid-settlement-deferred", "error", err)
@@ -1849,7 +1898,7 @@ func (s *Service) settleCurrentAuctionWonListingsLocked(session *gameSession) {
 		// 竞拍成交记录：SettleWonListings 只返回**本次真的结算掉**的那些挂单
 		// （已经写过 delivery/payout 行的行会被它跳过，结算完还会把挂单行删掉），
 		// 所以这份列表本身就是"这一次的跃迁集合"，重复跑这个扫描拿到的是空列表，
-		// 不会重复记。这正是每个拍卖命令开头都能安全调用它的原因。
+		// 不会重复记；后台恢复再次扫描时仍保持同样的幂等边界。
 		//
 		// 没有 quantity/unit_price 这类字段：挂单行在结算时已经被删除，
 		// 结算结果里只带得走成交价与件数，缺的就留空，不为凑字段回查数据库。
@@ -2137,19 +2186,23 @@ func cloneCurrentAuctionAttachmentExtra(source map[string]string) map[string]str
 }
 
 func (s *Service) sendCurrentAuctionOwnedItemsLocked(session *gameSession, body []byte) error {
+	return s.prepareCurrentAuctionOwnedItemsLocked(session, body).send(s, session)
+}
+
+func (s *Service) prepareCurrentAuctionOwnedItemsLocked(session *gameSession, body []byte) currentAuctionReadResponse {
 	opcode := uint16(dnfenum.CmdPacketAuctionMyRegistedItemInfo)
 	// 金币寄售 has its own 我寄售的金币 tab on op188. It sends the same one-byte
 	// shape as the item tab but with mode 1. Live capture 2026-09-21T09:43:18Z,
 	// packet_log.txt: op188 body `01`, answered 00 99 00 - the third popup.
 	if len(body) == 1 && body[0] == currentAuctionPayTypeConsignment {
-		return s.sendGameUpperRawClass(session, opcode, []byte{0, currentAuctionFailureCode, 1}, 1)
+		return currentAuctionReadRaw(opcode, []byte{0, currentAuctionFailureCode, 1}, 1)
 	}
 	if len(body) != 1 || body[0] != currentAuctionPayTypeGold {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
 	owner, err := s.currentAuctionOwner()
 	if err != nil {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
 	defer cancel()
@@ -2158,7 +2211,7 @@ func (s *Service) sendCurrentAuctionOwnedItemsLocked(session *gameSession, body 
 	}
 	claim, err := owner.ReturnExpiredListings(ctx, selectedCharacterIDString(session), strings.TrimSpace(s.accountIDForSession(session)))
 	if err != nil {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
 	for _, expired := range claim.ExpiredReturns {
 		if deliveryErr := s.deliverCurrentAuctionExpiredMailLocked(ctx, owner, expired); deliveryErr != nil {
@@ -2170,7 +2223,7 @@ func (s *Service) sendCurrentAuctionOwnedItemsLocked(session *gameSession, body 
 	}
 	listings, err := owner.Search(ctx, nil)
 	if err != nil {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
 	// Recover listings created by older builds that accepted equipment/avatar
 	// rows the current 83-byte projector cannot preserve. They must never stay
@@ -2198,9 +2251,9 @@ func (s *Service) sendCurrentAuctionOwnedItemsLocked(session *gameSession, body 
 	}
 	listings, err = owner.Search(ctx, nil)
 	if err != nil {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
-	return s.sendGameUpperSuccess(session, opcode, buildCurrentAuctionOwnedBody(listings, selectedCharacterIDString(session), s.currentAuctionItemEligible))
+	return currentAuctionReadSuccess(opcode, buildCurrentAuctionOwnedBody(listings, selectedCharacterIDString(session), s.currentAuctionItemEligible))
 }
 
 // sendCurrentAuctionGoldOwnedItemsLocked now lives in
@@ -2211,21 +2264,25 @@ func (s *Service) sendCurrentAuctionOwnedItemsLocked(session *gameSession, body 
 // character has outbid, been outbid on, or already won has left the live
 // listing set, so the tab is exactly "consignments I am currently winning".
 func (s *Service) sendCurrentAuctionBiddingItemsLocked(session *gameSession, body []byte) error {
+	return s.prepareCurrentAuctionBiddingItemsLocked(session, body).send(s, session)
+}
+
+func (s *Service) prepareCurrentAuctionBiddingItemsLocked(session *gameSession, body []byte) currentAuctionReadResponse {
 	opcode := uint16(dnfenum.CmdPacketAuctionMyBiddingInfo)
 	if len(body) != 1 || body[0] != currentAuctionPayTypeGold {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
 	owner, err := s.currentAuctionOwner()
 	if err != nil {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
 	defer cancel()
 	listings, err := owner.Search(ctx, nil)
 	if err != nil {
-		return s.sendGameUpperFailure(session, opcode, currentAuctionFailureCode)
+		return currentAuctionReadFailure(opcode, currentAuctionFailureCode)
 	}
-	return s.sendGameUpperSuccess(session, opcode, buildCurrentAuctionBiddingBody(
+	return currentAuctionReadSuccess(opcode, buildCurrentAuctionBiddingBody(
 		listings, selectedCharacterIDString(session), s.currentAuctionItemEligible, time.Now().UTC()))
 }
 
@@ -2244,7 +2301,8 @@ func (s *Service) sendCurrentAuctionBiddingItemsLocked(session *gameSession, bod
 // Account-shared crystal/soul cells are the one exception and keep (0, 0): the
 // right-hand crystal panel recognises a zero pair as "empty" and does not
 // understand 0xFFFFFFFF (see sendSelectedIncrementalItemSlotRefreshes).
-func (s *Service) sendCurrentAuctionInventorySlot(session *gameSession, listType byte, slot int16, inventory dnfrepo.InventoryRecord) error {
+func (s *Service) sendCurrentAuctionInventorySlot(session *gameSession, listType byte, slot int16, inventory dnfrepo.InventoryRecord, replies ...*currentAuctionMutationBatch) error {
+	batch := currentAuctionMutationReplies(replies)
 	stack, exists := inventory.Slots[inventorySlotKey(listType, slot)]
 	var entry currentItemListEntry
 	switch {
@@ -2255,7 +2313,7 @@ func (s *Service) sendCurrentAuctionInventorySlot(session *gameSession, listType
 	default:
 		entry.patchCore(slot, math.MaxUint32, 0)
 	}
-	return s.sendGameUpperRawClass(session, 14, buildCurrentItemUpdateBody(listType, []currentItemListEntry{entry}), 0)
+	return batch.raw(s, session, 14, buildCurrentItemUpdateBody(listType, []currentItemListEntry{entry}), 0)
 }
 
 func inventorySlotKey(listType byte, slot int16) string {

@@ -2,6 +2,7 @@ package dnfbridge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"longheng.io/server/internal/modules/dnf/dnfenum"
@@ -31,7 +32,7 @@ func (s *Service) sendCurrentFinishLoadingCharacterState(session *gameSession, s
 	}
 	gates := session.finishLoadingGateSnapshot()
 	if err := s.restoreCurrentRaidSessionProjection(session, source+"_raid_session_restore"); err != nil {
-		return err
+		return s.currentRaidProfileRequestError(session, err)
 	}
 	stateNeeded := !gates.State
 	completionNeeded := !gates.Completion && !currentTownReturnOmitsSceneActivation(session)
@@ -54,6 +55,11 @@ func (s *Service) sendCurrentFinishLoadingCharacterState(session *gameSession, s
 			return err
 		}
 		session.setFinishLoadingGateCompletion(true)
+	}
+	if plan := session.partyLoadingPrepared; plan != nil {
+		if err := plan.finishAfterActivation(); err != nil {
+			return err
+		}
 	}
 	if err := s.sendCurrentPostFinishLoadingPlayerState(session, source+"_after_finish_loading_state"); err != nil {
 		return err
@@ -85,7 +91,10 @@ func (s *Service) sendCurrentFinishLoadingCharacterState(session *gameSession, s
 		return err
 	}
 	s.refreshCurrentAccountFriendPresence(session, "finish_loading_after_player_state")
-	return s.sendBuffSwapReapply(session, source+"_after_finish_loading_player_state")
+	if err := s.sendBuffSwapReapply(session, source+"_after_finish_loading_player_state"); err != nil {
+		return err
+	}
+	return errors.Join(s.queueCurrentWeddingBenefitsReplay(session, source), s.queueCurrentWeddingCeremonyRecovery(session))
 }
 
 // sendCurrentFinishLoadingCharacterStateSnapshot writes the class0/op37
@@ -94,6 +103,23 @@ func (s *Service) sendCurrentFinishLoadingCharacterState(session *gameSession, s
 // selected actor, while ordinary client op37 handling keeps its own gates in
 // sendCurrentFinishLoadingCharacterState.
 func (s *Service) sendCurrentFinishLoadingCharacterStateSnapshot(session *gameSession, source string) error {
+	var body []byte
+	if plan := session.partyLoadingPrepared; plan != nil && len(plan.finishBody) != 0 {
+		body = plan.finishBody
+	} else {
+		var err error
+		body, err = s.prepareCurrentFinishLoadingCharacterStateSnapshot(session, source)
+		if err != nil {
+			return err
+		}
+	}
+	err := s.sendGameUpperRawClass(session, uint16(dnfenum.CmdPacketFinishLoading), body, 0)
+	if err == nil {
+		s.logGameEvent(session, "game-main-finish-loading-state-send", "source", source, "char_id", session.selectedCharacterID, "body_len", len(body), "classification", 0, "msg_id", uint16(dnfenum.CmdPacketFinishLoading))
+	}
+	return err
+}
+func (s *Service) prepareCurrentFinishLoadingCharacterStateSnapshot(session *gameSession, source string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
 	defer cancel()
 	charID, _, character, hasCharacter := s.selectedCharacterForEnter(ctx, session)
@@ -102,7 +128,7 @@ func (s *Service) sendCurrentFinishLoadingCharacterStateSnapshot(session *gameSe
 			"source", source,
 			"char_id", charID,
 			"reason", "selected_character_record_missing")
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"finish-loading character snapshot unavailable: selected=%d loaded=%d found=%t",
 			session.selectedCharacterID,
 			charID,
@@ -114,11 +140,11 @@ func (s *Service) sendCurrentFinishLoadingCharacterStateSnapshot(session *gameSe
 		var channelErr error
 		repositories, channelErr = s.currentChannelSkillRepositories(ctx, session, character, repositories)
 		if channelErr != nil {
-			return channelErr
+			return nil, channelErr
 		}
 		skill, found, err := repositories.Skill.Load(ctx, character.CharacterID)
 		if err != nil {
-			return fmt.Errorf("load finish-loading skill points for character %s: %w", character.CharacterID, err)
+			return nil, fmt.Errorf("load finish-loading skill points for character %s: %w", character.CharacterID, err)
 		}
 		if found {
 			points = skill.Points
@@ -146,9 +172,9 @@ func (s *Service) sendCurrentFinishLoadingCharacterStateSnapshot(session *gameSe
 	}
 	body := buildCurrentFinishLoadingCharacterStateBody(character, points)
 	if len(body) != currentFinishLoadingCharacterStateBodySize {
-		return fmt.Errorf("current finish-loading state body length %d, want %d", len(body), currentFinishLoadingCharacterStateBodySize)
+		return nil, fmt.Errorf("current finish-loading state body length %d, want %d", len(body), currentFinishLoadingCharacterStateBodySize)
 	}
-	s.logGameEvent(session, "game-main-finish-loading-state-send",
+	s.logGameEvent(session, "game-main-finish-loading-state-prepared",
 		"source", source,
 		"char_id", charID,
 		"msg_id", uint16(dnfenum.CmdPacketFinishLoading),
@@ -161,7 +187,7 @@ func (s *Service) sendCurrentFinishLoadingCharacterStateSnapshot(session *gameSe
 		"dynamic_count", body[0x2e],
 		"request_followups", true,
 		"body_source", "current_exe_sub_1D78240_real_character_minimum_dynamic_table_empty")
-	return s.sendGameUpperRawClass(session, uint16(dnfenum.CmdPacketFinishLoading), body, 0)
+	return body, nil
 }
 
 func (s *Service) sendCurrentIncreaseStatusResult(session *gameSession, source string) error {
@@ -251,10 +277,12 @@ func (s *Service) sendCurrentPostFinishLoadingPlayerState(session *gameSession, 
 	// of dungeon actor initialization. Replaying it after op37 opens that panel
 	// over the dungeon and can replace live room actor state, so this boundary
 	// deliberately emits only the skill refresh and current HP/MP placement.
-	placementBody := buildCurrentSceneActorPlacementBody()
+	placementBody := s.currentLocalDungeonPlacementBody(session)
 	if err := s.sendGameUpperRawClass(session, uint16(dnfenum.CmdPacketRequestBlacklist), placementBody, 0); err != nil {
 		return err
 	}
+	s.logGameEvent(session, "game-dungeon-local-slot-placement",
+		"char_id", charID, "slot", placementBody[0], "source", source)
 	// Only PVF tutorial scenes defer state 1 to this boundary.  Ordinary
 	// dungeons sent it after their proven mode0/mode1 actor binding above;
 	// replaying it here suppresses the native GetItem writer on the current EXE.

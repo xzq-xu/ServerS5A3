@@ -71,11 +71,15 @@ func (s *Service) loadAdventureGroupTable(ctx context.Context) (*adventuregroup.
 }
 
 func (s *Service) currentAccountAdventureGroupSummary(ctx context.Context, selected dnfrepo.CharacterRecord, hasSelected bool, sessions ...*gameSession) (adventuregroup.Summary, error) {
-	state, err := s.currentAccountAdventureGroupState(ctx, selected, hasSelected, sessions...)
+	state, err := s.readAccountAdventureGroupState(ctx, selected, hasSelected, false, sessions...)
 	return state.Summary, err
 }
 
 func (s *Service) currentAccountAdventureGroupState(ctx context.Context, selected dnfrepo.CharacterRecord, hasSelected bool, sessions ...*gameSession) (accountAdventureGroupState, error) {
+	return s.readAccountAdventureGroupState(ctx, selected, hasSelected, true, sessions...)
+}
+
+func (s *Service) readAccountAdventureGroupState(ctx context.Context, selected dnfrepo.CharacterRecord, hasSelected, full bool, sessions ...*gameSession) (accountAdventureGroupState, error) {
 	if s == nil {
 		return accountAdventureGroupState{}, errAdventureGroupTableUnavailable
 	}
@@ -89,7 +93,7 @@ func (s *Service) currentAccountAdventureGroupState(ctx context.Context, selecte
 		}
 		return accountAdventureGroupState{}, errAdventureGroupTableUnavailable
 	}
-	repositories, ok := s.repositoryGroup()
+	repositories, ok := s.repositoryGroupFor(ctx)
 	if !ok || repositories.Character == nil {
 		return accountAdventureGroupState{}, errAdventureGroupRosterUnavailable
 	}
@@ -100,15 +104,41 @@ func (s *Service) currentAccountAdventureGroupState(ctx context.Context, selecte
 			return accountAdventureGroupState{}, fmt.Errorf("%w: selected=%q current=%q", errAdventureGroupOwnerMismatch, selectedAccountID, accountID)
 		}
 	}
-	characters, err := repositories.Character.ListByAccount(ctx, accountID, defaultCharacterSlots)
-	if err != nil {
-		return accountAdventureGroupState{}, fmt.Errorf("list dnf adventure-group account characters: %w", err)
+	var characters []dnfrepo.CharacterRecord
+	var rows []adventuregroup.Character
+	if full {
+		var err error
+		characters, err = repositories.Character.ListByAccount(ctx, accountID, defaultCharacterSlots)
+		if err != nil {
+			return accountAdventureGroupState{}, fmt.Errorf("list dnf adventure-group account characters: %w", err)
+		}
+		for _, ch := range characters {
+			rows = append(rows, adventuregroup.Character{Level: ch.Level, Deleted: ch.Stats["delete_flag"] != 0})
+		}
+	} else {
+		levels, err := dnfrepo.ListAccountCharacterLevels(ctx, repositories.Character, accountID, defaultCharacterSlots)
+		if err != nil {
+			return accountAdventureGroupState{}, fmt.Errorf("list dnf adventure-group account levels: %w", err)
+		}
+		for _, ch := range levels {
+			rows = append(rows, adventuregroup.Character{Level: ch.Level, Deleted: ch.Deleted})
+		}
 	}
-	rows := make([]adventuregroup.Character, 0, len(characters))
-	for _, character := range characters {
-		rows = append(rows, adventuregroup.Character{Level: character.Level})
+	var earned uint64
+	if table.UsesAccountExperience() {
+		if repositories.Account == nil {
+			return accountAdventureGroupState{}, errAdventureGroupRosterUnavailable
+		}
+		honor, found, loadErr := dnfrepo.LoadAccountHonorExperience(ctx, repositories.Account, accountID)
+		if loadErr != nil {
+			return accountAdventureGroupState{}, loadErr
+		}
+		if !found {
+			return accountAdventureGroupState{}, errAdventureGroupOwnerMismatch
+		}
+		earned = honor
 	}
-	summary, err := table.Calculate(rows)
+	summary, err := table.CalculateCombinedExperience(rows, earned)
 	if err != nil {
 		return accountAdventureGroupState{}, err
 	}
@@ -169,6 +199,19 @@ func (s *Service) currentAccountAdventureGroupInfoState(
 
 // Shared read-only projection; observing a login remains the caller's choice.
 func (s *Service) projectCurrentAdventureAccountState(state accountAdventureGroupState, account dnfrepo.AccountRecord) (accountAdventureGroupState, error) {
+	if s.adventureGroupTable.UsesAccountExperience() {
+		// The full info path has just read the account again. Keep its level bar
+		// and capsule/shop fields on that same durable account snapshot.
+		var err error
+		rows := make([]adventuregroup.Character, 0, len(state.Characters))
+		for _, character := range state.Characters {
+			rows = append(rows, adventuregroup.Character{Level: character.Level, Deleted: character.Stats["delete_flag"] != 0})
+		}
+		state.Summary, err = s.adventureGroupTable.CalculateCombinedExperience(rows, account.HonorExp)
+		if err != nil {
+			return accountAdventureGroupState{}, err
+		}
+	}
 	total, err := dnfpvp.ReadTotalProgress(account)
 	if err != nil {
 		return accountAdventureGroupState{}, fmt.Errorf("读取冒险团决斗累计胜场：%w", err)

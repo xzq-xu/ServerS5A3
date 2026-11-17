@@ -94,11 +94,13 @@ func (s *Service) processCurrentLevelUpRewards(parent context.Context, character
 	}
 	ctx, cancel := context.WithTimeout(parent, createWriteTimeout)
 	defer cancel()
-	character, found, err := repos.Character.Load(ctx, characterID)
+	probe, found, err := dnfrepo.ProbeLevelUpRewards(ctx, repos.Character, characterID)
 	if err == nil && found {
-		s.refreshCurrentLuckyCharacterAfterProgression(ctx, character)
+		s.refreshCurrentLuckyCharacterAfterProgression(ctx, dnfrepo.CharacterRecord{
+			CharacterID: probe.CharacterID, AccountID: probe.AccountID, Level: probe.Level,
+		})
 	}
-	if err == nil && (!found || !dnfrepo.HasPendingLevelUp(character)) {
+	if err == nil && (!found || !probe.Pending) {
 		return
 	}
 	// Cap revocation is independent of mail contention and retry delays.
@@ -210,7 +212,8 @@ func (s *Service) notifyCurrentLevelUpRewards(ctx context.Context, identity boun
 	}
 }
 
-// 统一命令尾覆盖经验发送者及队友。奖励事实来自仓储，不以客户端发来的等级认领。
+// Explicit reconciliation for a bound party. Ordinary packet dispatch does not
+// call this: committed progression wakes the worker for the changed character.
 func (s *Service) afterCurrentLevelUpRewardCommand(session *gameSession) {
 	if s == nil || s.options.currentClientVersion != "official-24.9" {
 		return
@@ -279,16 +282,38 @@ func (s *Service) startCurrentLevelUpRewardClock(ctx context.Context) {
 		return
 	}
 	wake := make(chan struct{}, 1)
+	committed := make(chan string, 1024)
+	repos, _ := s.repositoryGroup()
+	unsubscribe := repos.LevelUpChanges.Subscribe(func(id string) {
+		select {
+		case committed <- id:
+		default:
+		} // Durable recovery covers overflow.
+	})
 	wake <- struct{}{}
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer unsubscribe()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-wake:
 				s.recoverCurrentLevelUpRewards(ctx)
+			case id := <-committed:
+				// Coalesce the currently queued commits without holding a SQL
+				// transaction or the originating player's event loop.
+				ids := map[string]struct{}{id: {}}
+				for n := len(committed); n > 0; n-- {
+					ids[<-committed] = struct{}{}
+				}
+				for changed := range ids {
+					if ctx.Err() != nil {
+						return
+					}
+					s.processCurrentLevelUpRewards(ctx, changed)
+				}
 			}
 		}
 	}()

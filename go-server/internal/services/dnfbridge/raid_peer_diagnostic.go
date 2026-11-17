@@ -3,28 +3,7 @@ package dnfbridge
 // Preserve bounded model/barrier delivery evidence when raw packet logging is
 // disabled. Deliberately exclude packet bodies, account data and error strings.
 func (s *Service) logRaidPeerDiagnostic(kind string, fields ...any) {
-	switch kind {
-	case "game-dungeon-party-peer-actor-delivered",
-		"game-party-entry-rejected",
-		"game-party-entry-confirmed",
-		"game-peer-userinfo-profile-refresh-sent",
-		"game-peer-userinfo-profile-refresh-failed",
-		"game-dungeon-party-peer-actor-send",
-		"game-current-party-frame-op9-send",
-		"game-current-party-frame-op9-remove-send",
-		"game-party-dungeon-peer-actor-landing-resend",
-		"game-dungeon-party-peer-actor-resend",
-		"game-raid-volcano-barrier-symbols-sent",
-		"game-fiendwar-party-admission",
-		"game-party-dungeon-loading-ready",
-		"game-party-dungeon-loading-released",
-		"game-party-dungeon-post-start-map-placement-deferred",
-		"game-party-dungeon-post-start-map-placement-released",
-		"game-party-dungeon-post-start-map-placement-skipped",
-		"game-party-peer-endpoint-registration-rejected",
-		"party-udp-relay-silent-peer-kick",
-		"party-udp-relay-silent-peer-kick-failed":
-	default:
+	if !isRaidPeerDiagnostic(kind) {
 		return
 	}
 	args := []any{"kind", kind}
@@ -32,6 +11,15 @@ func (s *Service) logRaidPeerDiagnostic(kind string, fields ...any) {
 	for i := 0; i+1 < len(fields); i += 2 {
 		key, ok := fields[i].(string)
 		if !ok {
+			continue
+		}
+		if isDungeonActorPlacementDiagnosticKind(kind) {
+			switch key {
+			case "conn_id", "channel_id", "char_id", "receiver_char_id", "actor_char_id",
+				"party_id", "instance_id", "map_id", "slot", "slots", "slot_count",
+				"source", "peer_profiles_before_placement", "revived":
+				args = append(args, key, fields[i+1])
+			}
 			continue
 		}
 		if kind == "game-party-entry-rejected" || kind == "game-party-entry-confirmed" {
@@ -114,7 +102,20 @@ func (s *Service) logRaidPeerDiagnostic(kind string, fields ...any) {
 	case "game-party-dungeon-post-start-map-placement-skipped":
 		args = append(args, "event_phase", "placement_skipped")
 	}
+	if isDungeonActorPlacementDiagnosticKind(kind) {
+		// These are post-write observations, not native actor/render ACKs.
+		args = append(args, "event_phase", "socket_write_completed", "client_model_verified", false)
+	}
 	s.logInfo("dnfbridge raid peer diagnostic", args...)
+}
+
+func isDungeonActorPlacementDiagnosticKind(kind string) bool {
+	switch kind {
+	case "game-party-initial-slot-placement", "game-dungeon-local-slot-placement", "game-dungeon-party-life-notify-sent":
+		return true
+	default:
+		return false
+	}
 }
 
 func isPartyDungeonLoadingDiagnosticKind(kind string) bool {
@@ -124,6 +125,37 @@ func isPartyDungeonLoadingDiagnosticKind(kind string) bool {
 		"game-party-dungeon-post-start-map-placement-deferred",
 		"game-party-dungeon-post-start-map-placement-released",
 		"game-party-dungeon-post-start-map-placement-skipped":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRaidPeerDiagnostic(kind string) bool {
+	switch kind {
+	case "game-dungeon-party-peer-actor-delivered",
+		"game-party-initial-slot-placement",
+		"game-dungeon-local-slot-placement",
+		"game-dungeon-party-life-notify-sent",
+		"game-party-entry-rejected",
+		"game-party-entry-confirmed",
+		"game-peer-userinfo-profile-refresh-sent",
+		"game-peer-userinfo-profile-refresh-failed",
+		"game-dungeon-party-peer-actor-send",
+		"game-current-party-frame-op9-send",
+		"game-current-party-frame-op9-remove-send",
+		"game-party-dungeon-peer-actor-landing-resend",
+		"game-dungeon-party-peer-actor-resend",
+		"game-raid-volcano-barrier-symbols-sent",
+		"game-fiendwar-party-admission",
+		"game-party-dungeon-loading-ready",
+		"game-party-dungeon-loading-released",
+		"game-party-dungeon-post-start-map-placement-deferred",
+		"game-party-dungeon-post-start-map-placement-released",
+		"game-party-dungeon-post-start-map-placement-skipped",
+		"game-party-peer-endpoint-registration-rejected",
+		"party-udp-relay-silent-peer-kick",
+		"party-udp-relay-silent-peer-kick-failed":
 		return true
 	default:
 		return false

@@ -46,24 +46,27 @@ func (s *Service) sendCurrentAntonRewardFlowProjection(session *gameSession, cap
 	var packets []currentAntonRewardPacket
 	lukePartyOnly := b.Mode == 2 && b.Phase == 0 && !f.Single
 	lukeFinal := b.Mode == 2 && b.Phase == 1 && !f.Single
+	antonFinal := b.Mode == 1 && b.Phase == 1 && !f.Single
 	fiendWar := b.Mode == 3
-	if !f.SquadShownAt.IsZero() && f.squadRequired() {
+	if currentRaidOwnerRewardsCommitted(f, session.selectedCharacterID) && f.squadRequired() && currentRaidOwnerSquadReady(f, session.selectedCharacterID, time.Now()) {
 		var cards []raid.RewardDisplayCard
 		for _, recipient := range f.Recipients {
 			card := f.Squad[recipient.CharacterID]
-			if card == nil || !card.Committed {
-				s.logCurrentRaidRewardWire(session, currentAntonRewardPacket{opcode: 600}, b.InstanceID, b.Mode, b.Phase, false, "squad_card_uncommitted")
-				return raid.ErrRewardReceipt
+			display := raid.RewardDisplayCard{CharacterID: recipient.CharacterID, CardType: 1}
+			if card != nil && card.Committed {
+				display.Items = currentAntonPartyDisplayItems(card.Plan)
 			}
-			cards = append(cards, raid.RewardDisplayCard{CharacterID: recipient.CharacterID, CardType: 1, Items: currentAntonPartyDisplayItems(card.Plan)})
+			// A failed peer remains pending; never advertise an uncommitted plan
+			// as awarded, and never hold another owner's display for its retry.
+			cards = append(cards, display)
 		}
 		body, err := raid.BuildRewardListBody(3, cards)
 		if err != nil {
 			return err
 		}
 		packets = append(packets, currentAntonRewardPacket{opcode: 587, body: []byte{4, 0}})
-		if (fiendWar || lukeFinal) && owner != nil {
-			// Fiend War and final Luke can commit both pools in one advance.
+		if !f.Single && owner != nil {
+			// Fiend War and final team Anton/Luke can commit both pools in one advance.
 			// Native kind3 populates category2 only; it cannot reveal the
 			// committed party items in category0. Restore both displays from
 			// their committed plans, without repeating either asset grant.
@@ -74,10 +77,11 @@ func (s *Service) sendCurrentAntonRewardFlowProjection(session *gameSession, cap
 					continue
 				}
 				card := f.Party[recipient.CharacterID]
-				if card == nil || !card.Committed {
-					return raid.ErrRewardReceipt
+				display := raid.RewardDisplayCard{CharacterID: recipient.CharacterID, CardType: byte(len(partyCards) + 1)}
+				if card != nil && card.Committed {
+					display.CardType, display.Items = card.Card, currentAntonPartyDisplayItems(card.Plan)
 				}
-				partyCards = append(partyCards, raid.RewardDisplayCard{CharacterID: recipient.CharacterID, CardType: card.Card, Items: currentAntonPartyDisplayItems(card.Plan)})
+				partyCards = append(partyCards, display)
 			}
 			partyBody, err := raid.BuildRewardListBody(1, partyCards)
 			if err != nil {
@@ -182,7 +186,7 @@ func (s *Service) sendCurrentAntonRewardFlowProjection(session *gameSession, cap
 			filtered = append(filtered, packet)
 		}
 		packets = filtered
-	} else if (lukePartyOnly || lukeFinal || fiendWar) && len(displayBodies) == 2 && o.rewardDisplayIdentity == identity && o.rewardDisplaySignature == sha256.Sum256(displayBodies[0]) {
+	} else if !f.Single && len(displayBodies) == 2 && o.rewardDisplayIdentity == identity && o.rewardDisplaySignature == sha256.Sum256(displayBodies[0]) {
 		// A successful manual/earlier party projection already delivered
 		// this exact kind1. Append only its missing team list; never
 		// replay the flip. A new connection must receive both in order.
@@ -195,16 +199,26 @@ func (s *Service) sendCurrentAntonRewardFlowProjection(session *gameSession, cap
 		}
 		packets = filtered
 	}
-	trackedScreen := lukePartyOnly || lukeFinal || fiendWar || b.Mode == 1 && (f.SquadShownAt.IsZero() || b.Phase == 0 && !f.Single)
+	trackedScreen := lukePartyOnly || lukeFinal || antonFinal || fiendWar || b.Mode == 1 && (!currentRaidOwnerRewardsCommitted(f, session.selectedCharacterID) || b.Phase == 0 && !f.Single)
 	if trackedScreen && o.rewardScreenSent && o.rewardScreenIdentity == identity {
 		// Normal Anton phase zero keeps the same open panel for kind3. Its
 		// native consumer updates that panel; another state4 has unrelated
 		// reset side effects. A fresh connection still needs state4 first.
 		// Normal Luke also keeps its current panel when either pool arrives.
-		// Final/single Anton and single Luke retain their existing behavior.
+		// Single Anton and single Luke retain their existing behavior.
 		filtered := packets[:0]
 		for _, packet := range packets {
 			if packet.opcode == 587 && len(packet.body) == 2 && packet.body[0] == 4 && packet.body[1] == 0 {
+				continue
+			}
+			filtered = append(filtered, packet)
+		}
+		packets = filtered
+	}
+	if o.rewardListIdentity == identity {
+		filtered := packets[:0]
+		for _, packet := range packets {
+			if packet.opcode == 600 && len(packet.body) > 0 && packet.body[0] < 4 && o.rewardListSignatures[packet.body[0]] == sha256.Sum256(packet.body) {
 				continue
 			}
 			filtered = append(filtered, packet)
@@ -221,16 +235,10 @@ func (s *Service) sendCurrentAntonRewardFlowProjection(session *gameSession, cap
 		}
 		packets = append(packets, currentAntonRewardPacket{opcode: 597, body: raid.BuildRemainingTimeBody(1, uint32(remaining))})
 	}
-	if !f.FinishedAt.IsZero() {
-		// A legitimate raid runtime binding is required for this notification.
-		session.dungeon.mu.Lock()
-		runtime := session.dungeon.runtime
-		bound := runtime != nil && runtime.raidEntry != nil && runtime.raidEntry.InstanceID == b.InstanceID && runtime.raidEntry.Phase == b.Phase && dungeonRuntimeOwnsCharacter(runtime, session.selectedCharacterID)
-		session.dungeon.mu.Unlock()
-		if bound {
-			packets = append(packets, currentAntonRewardPacket{opcode: 115, body: []byte{0}})
-		}
-	}
+	// NOTI115 acknowledges a real boss-death request. It is neither a raid
+	// completion nor a town-return packet; even status zero consumes another
+	// byte in the current native reader. Reward projection must not replay it.
+
 	for _, packet := range packets {
 		if err := s.sendGameUpperRawClassCodec(session, packet.opcode, packet.body, packet.class, true); err != nil {
 			s.logCurrentRaidRewardWire(session, packet, b.InstanceID, b.Mode, b.Phase, false, "send_failed")
@@ -246,17 +254,9 @@ func (s *Service) sendCurrentAntonRewardFlowProjection(session *gameSession, cap
 		if packet.opcode == 600 && len(packet.body) > 0 && packet.body[0] == 1 {
 			s.raidMu.Lock()
 			s.markCurrentAntonPartyShownLocked(b.InstanceID, b.Phase, time.Now())
-			if owner != nil && f.SquadShownAt.IsZero() {
+			if owner != nil && !currentRaidOwnerRewardsCommitted(f, session.selectedCharacterID) {
 				s.markCurrentRaidPartySelectionShownLocked(b.InstanceID, b.Phase, owner.CharacterID, time.Now())
 			}
-			s.raidMu.Unlock()
-			break
-		}
-	}
-	for _, packet := range packets {
-		if packet.opcode == 600 && len(packet.body) > 0 && packet.body[0] == 1 {
-			s.raidMu.Lock()
-			s.markCurrentAntonPartyShownLocked(b.InstanceID, b.Phase, time.Now())
 			s.raidMu.Unlock()
 			break
 		}
@@ -291,8 +291,34 @@ func (s *Service) sendCurrentAntonRewardFlowProjection(session *gameSession, cap
 		}
 	}
 	o.rewardFlowIdentity, o.rewardFlowSignature = identity, signature
+	if o.rewardListIdentity != identity {
+		o.rewardListIdentity, o.rewardListSignatures = identity, [4][32]byte{}
+	}
+	for _, packet := range packets {
+		if packet.opcode == 600 && len(packet.body) > 0 && packet.body[0] < 4 {
+			o.rewardListSignatures[packet.body[0]] = sha256.Sum256(packet.body)
+		}
+	}
 	if displaySignature != [32]byte{} {
+		if o.rewardDisplayIdentity != identity || o.rewardDisplaySignature != displaySignature {
+			o.rewardDisplayShownAt = time.Now()
+		}
 		o.rewardDisplayIdentity, o.rewardDisplaySignature = identity, displaySignature
+	}
+	// Keep an independent receipt for the actually written final team list.
+	// Normal phase two also projects a mutable local-party list; its combined
+	// dedup signature is not an ownership proof for automatic return.
+	for _, packet := range packets {
+		if packet.opcode == 600 && len(packet.body) > 0 && packet.body[0] == 3 {
+			squadSignature := currentRaidOwnerSquadDisplaySignature(f, session.selectedCharacterID)
+			if !f.squadRequired() {
+				squadSignature = sha256.Sum256(packet.body)
+			}
+			if o.rewardSquadDisplayIdentity != identity || o.rewardSquadDisplaySignature != squadSignature {
+				o.rewardSquadDisplayShownAt = time.Now()
+			}
+			o.rewardSquadDisplayIdentity, o.rewardSquadDisplaySignature = identity, squadSignature
+		}
 	}
 	return nil
 }

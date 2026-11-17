@@ -8,8 +8,9 @@ import (
 	"longheng.io/server/internal/modules/dnf/party"
 )
 
-// A member's explicit mid-run giveup leaves the party after the town scene
-// is confirmed. Completion and automatic deadline returns never call this.
+// An explicit personal giveup or leave-party request leaves the party after
+// the town scene is confirmed, including after completion. Result-page team
+// returns and automatic deadline returns keep their separate policies.
 // The remaining members retain their dungeon runtime and shared instance.
 func (s *Service) leaveRuntimePartyOnMemberGiveup(session *gameSession, instance *dungeonPartyInstance) error {
 	_, err := s.leaveRuntimePartyDungeonMember(session, instance, "member_giveup_confirmed_town", true)
@@ -70,6 +71,14 @@ func (s *Service) leaveRuntimePartyDungeonMember(session *gameSession, instance 
 	if !removed {
 		return false, nil
 	}
+	instance.mu.Lock()
+	for _, member := range before.Members {
+		if member.Slot < 8 {
+			instance.retiredPartyRecordKeys[member.Slot] = member.UserID
+		}
+	}
+	instance.mu.Unlock()
+	s.partyDungeonLoadingBarrierForceRelease(before.ID, "member_left_party")
 	var errs error
 	if s.options.currentClientVersion != "official-24.9" {
 		for _, peer := range peers {
@@ -86,7 +95,9 @@ func (s *Service) leaveRuntimePartyDungeonMember(session *gameSession, instance 
 		errs = errors.Join(errs, s.sendRuntimePartyDeparture(session, before.StateFor(before.Leader)))
 	}
 	if s.options.currentClientVersion == "official-24.9" {
-		errs = errors.Join(errs, s.sendMemberGiveupSurvivorRosterAfterDeparture(next, instance, identity.character))
+		errs = errors.Join(errs, s.sendMemberGiveupSurvivorRosterAfterDepartureMode(next, instance, identity.character, !notifyDeparting, nil))
+	} else if !notifyDeparting {
+		s.queueDetachedPartyMemberRemoved(before.StateFor(before.Leader), next, identity.character)
 	} else {
 		errs = errors.Join(errs, s.broadcastRuntimePartyMemberRemoved(before.StateFor(before.Leader), next, identity.character, session))
 	}
@@ -102,6 +113,10 @@ func (s *Service) sendMemberGiveupSurvivorRoster(state alignedcmd.PartyState, in
 }
 
 func (s *Service) sendMemberGiveupSurvivorRosterAfterDeparture(state alignedcmd.PartyState, instance *dungeonPartyInstance, departingID uint16) error {
+	return s.sendMemberGiveupSurvivorRosterAfterDepartureMode(state, instance, departingID, false, nil)
+}
+
+func (s *Service) sendMemberGiveupSurvivorRosterAfterDepartureMode(state alignedcmd.PartyState, instance *dungeonPartyInstance, departingID uint16, deferPeers bool, only *gameSession) error {
 	var errs error
 	members := runtimePartyMembers(state)
 	// The return caller holds its own dungeon lock. Never acquire a peer's
@@ -113,6 +128,15 @@ func (s *Service) sendMemberGiveupSurvivorRosterAfterDeparture(state alignedcmd.
 			continue
 		}
 		receiver := identity.session
+		if only != nil && receiver != only {
+			continue
+		}
+		if deferPeers {
+			errs = errors.Join(errs, s.queueDetachedPartyProjection(identity, state, func() error {
+				return s.sendMemberGiveupSurvivorRosterAfterDepartureMode(state, instance, departingID, false, receiver)
+			}))
+			continue
+		}
 		current := s.currentPartyRetirementGuard(receiver, &state)
 		if !current() {
 			continue
@@ -127,6 +151,19 @@ func (s *Service) sendMemberGiveupSurvivorRosterAfterDeparture(state alignedcmd.
 		if !active {
 			errs = errors.Join(errs, s.sendRuntimePartyMemberRemoved(receiver, 0, state))
 			continue
+		}
+		if departingID != 0 && len(members) == 1 {
+			// Updating an active roster directly from two rows to one does not
+			// retire the native party HUD/network's previous peer entries. This
+			// is visible when a four-player party shrinks to its last fixed slot.
+			// There are no surviving remote actors to preserve now: retire the
+			// local client binding before restoring its server-owned singleton.
+			// Keep the manager, fixed slot and dungeon instance unchanged.
+			sent, err := s.resetDungeonSingletonPartyDisplay(receiver, state, instance, departingID, current)
+			if err != nil || !sent {
+				errs = errors.Join(errs, err)
+				continue
+			}
 		}
 		owners := []byte{currentSceneObjectContext}
 		if owner := currentClientSelectedChannel(receiver); owner != currentSceneObjectContext {
@@ -157,17 +194,56 @@ func (s *Service) sendMemberGiveupSurvivorRosterAfterDeparture(state alignedcmd.
 	return errs
 }
 
+func (s *Service) resetDungeonSingletonPartyDisplay(receiver *gameSession, state alignedcmd.PartyState, instance *dungeonPartyInstance, departingID uint16, current func() bool) (bool, error) {
+	if s.options.currentClientVersion != "official-24.9" || len(runtimePartyMembers(state)) != 1 {
+		return false, nil
+	}
+	owners := []byte{currentSceneObjectContext}
+	if owner := currentClientSelectedChannel(receiver); owner != currentSceneObjectContext {
+		owners = append([]byte{owner}, owners...)
+	}
+	instance.mu.Lock()
+	keys := instance.retiredPartyRecordKeys
+	instance.mu.Unlock()
+	ordered := []uint16{selectedCharacterID(receiver), departingID}
+	for _, key := range keys {
+		seen := key == 0
+		for _, old := range ordered {
+			seen = seen || old == key
+		}
+		if !seen {
+			ordered = append(ordered, key)
+		}
+	}
+	for _, key := range ordered {
+		for _, owner := range owners {
+			// The paired kind3 retirement helper preserves the living local
+			// drawable. Empty kind2 would run the destructive ordinary slot setter.
+			sent, err := s.sendRetiredPartyPacket(receiver, 9,
+				buildCurrentSceneOp9ActorRemovalBodyInContext(currentSceneActorObjectKey(key), owner, s.currentSceneActorRoute()), &state, current, false)
+			if err != nil || !sent {
+				return false, err
+			}
+		}
+	}
+	return s.sendRetiredPartyPacket(receiver, 0x99, runtimePartyRealtimeInfoBody(alignedcmd.PartyState{}), &state, current, false)
+}
+
 func (s *Service) sendMemberGiveupSurvivorRosterInContext(receiver *gameSession, state alignedcmd.PartyState, departingID uint16, owner byte, current func() bool) (bool, error) {
 	selection := currentPartyFrameOwnerSelection{Mode: currentPartyFrameOwnerExplicit, Owner: owner}
 	if departingID != 0 {
-		// Diff the local roster before clearing the departed actor's record;
-		// restore every surviving record before NOTI6 can erase its identity.
+		// Every record can still own a survivor's party binding. Give the
+		// departed actor's record the same retained roster, not an empty roster:
+		// native kind2 would otherwise destroy all its former peers' models and
+		// tear down the local network before the following kind0 can rebind it.
 		sent, err := s.sendCurrentPartyActorFrameProjectionInContext(receiver, receiver, state, "member_giveup_network_roster", nil, selection)
 		if err != nil || !sent {
 			return false, err
 		}
-		body := s.buildCurrentPartyDepartureBody(departingID, owner)
-		sent, err = s.sendRetiredPartyPacket(receiver, uint16(dnfenum.CmdPacketRecoverStamina), body, &state, current, false)
+		if !current() {
+			return false, nil
+		}
+		sent, err = s.sendCurrentPartyRecordProjectionInContext(receiver, receiver, state, "member_giveup_retained_record", nil, selection, departingID)
 		if err != nil || !sent {
 			return false, err
 		}

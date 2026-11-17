@@ -44,12 +44,22 @@ func (s *Service) sendCurrentCrossSceneProfileFrame(ctx context.Context, viewer,
 // order of gameplay handlers that send while holding dungeon.mu.
 func (s *Service) lockCurrentCrossSceneProfileForDelivery(ctx context.Context, viewer, actor *gameSession, needsHP bool) ([]byte, error) {
 	for {
-		if err := lockCurrentCrossSceneProfile(ctx, &actor.crossSceneAppearanceMu); err != nil {
+		if err := lockCurrentCrossSceneProfile(ctx, &viewer.wireMu); err != nil {
 			return nil, err
 		}
-		if err := lockCurrentCrossSceneProfile(ctx, &viewer.wireMu); err != nil {
-			actor.crossSceneAppearanceMu.Unlock()
-			return nil, err
+		// A busy recipient must not retain the shared actor lock while its
+		// unrelated gameplay write finishes. Other callers acquire appearance
+		// first, so the inverse acquisition here is strictly try-only.
+		if !actor.crossSceneAppearanceMu.TryLock() {
+			viewer.wireMu.Unlock()
+			timer := time.NewTimer(time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+				continue
+			}
 		}
 		var realtime []byte
 		ready := true
@@ -83,8 +93,24 @@ func (s *Service) sendCurrentCrossSceneProfileFrames(ctx context.Context, viewer
 }
 
 func (s *Service) sendCurrentCrossSceneProfileFramesWithBudget(ctx context.Context, viewer, actor *gameSession, bodies [][]byte, current func() bool, completeAdmittedWrite bool) (bool, error) {
+	return s.sendCurrentCrossSceneProfileFramesWithPolicy(ctx, viewer, actor, bodies, current, completeAdmittedWrite, false)
+}
+
+// An automatic refresh contains one immutable frame. Admit it under the actor
+// lock, then keep only the recipient wire locked during the socket write. A
+// newer appearance for this recipient must still wait for that same wire, but
+// unrelated recipients and appearance invalidation need not wait for its socket.
+// Explicit multi-frame inspection retains its existing locking contract.
+func (s *Service) sendCurrentCrossSceneProfileRefreshFrame(ctx context.Context, viewer, actor *gameSession, body []byte, current func() bool, completeAdmittedWrite bool) (bool, error) {
+	return s.sendCurrentCrossSceneProfileFramesWithPolicy(ctx, viewer, actor, [][]byte{body}, current, completeAdmittedWrite, true)
+}
+
+func (s *Service) sendCurrentCrossSceneProfileFramesWithPolicy(ctx context.Context, viewer, actor *gameSession, bodies [][]byte, current func() bool, completeAdmittedWrite, immutableRefresh bool) (bool, error) {
 	if len(bodies) == 0 {
 		return false, errors.New("cross-scene profile frame list is empty")
+	}
+	if immutableRefresh && len(bodies) != 1 {
+		return false, errors.New("automatic cross-scene refresh requires one immutable frame")
 	}
 	ctx, cancel := context.WithTimeout(ctx, createWriteTimeout)
 	defer cancel()
@@ -104,7 +130,12 @@ func (s *Service) sendCurrentCrossSceneProfileFramesWithBudget(ctx context.Conte
 	if err != nil {
 		return false, err
 	}
-	defer actor.crossSceneAppearanceMu.Unlock()
+	appearanceHeld := true
+	defer func() {
+		if appearanceHeld {
+			actor.crossSceneAppearanceMu.Unlock()
+		}
+	}()
 	defer viewer.wireMu.Unlock()
 	writeCtx := ctx
 	if completeAdmittedWrite {
@@ -112,7 +143,7 @@ func (s *Service) sendCurrentCrossSceneProfileFramesWithBudget(ctx context.Conte
 		// the protected wire must complete within its own bounded window; a
 		// shared raid preparation deadline is not evidence of a slow socket.
 		var cancelWrite context.CancelFunc
-		writeCtx, cancelWrite = context.WithTimeout(context.WithoutCancel(ctx), createWriteTimeout)
+		writeCtx, cancelWrite = context.WithTimeout(context.WithoutCancel(ctx), gameTransportWriteTimeout)
 		stopCancel := context.AfterFunc(ctx, func() {
 			if errors.Is(ctx.Err(), context.Canceled) {
 				cancelWrite()
@@ -143,6 +174,10 @@ func (s *Service) sendCurrentCrossSceneProfileFramesWithBudget(ctx context.Conte
 			if err != nil {
 				return false, err
 			}
+		}
+		if immutableRefresh {
+			actor.crossSceneAppearanceMu.Unlock()
+			appearanceHeld = false
 		}
 		err := s.sendGameUpperRawClassCodecLocked(viewer, uint16(dnfenum.CmdPacketSetUDPIPPort), body, 0, true)
 		if err != nil {

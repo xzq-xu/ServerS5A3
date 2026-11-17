@@ -377,6 +377,15 @@ func (o *Owner) repairSingleEquipped(
 	}
 	entry.Extra["durability"] = strconv.FormatInt(maxDurability, 10)
 	record.Entries[key] = entry
+	if freeRepair {
+		repaired, repairErr := repairAllWornDurability(&record, cmd.SlotIndex, costResolver, time.Now().UTC())
+		if repairErr != nil {
+			return RepairResult{}, repairErr
+		}
+		for _, restored := range repaired {
+			result.RepairedEquipmentSlots = append(result.RepairedEquipmentSlots, restored.SlotIndex)
+		}
+	}
 	record.UpdatedAt = time.Now()
 	if err := dnfrepo.SaveEquipmentFields(ctx, equipment, record, dnfrepo.EquipmentFieldEntries); err != nil {
 		return RepairResult{}, err
@@ -385,7 +394,7 @@ func (o *Owner) repairSingleEquipped(
 	result.UpdatedGold = gold - cost
 	result.Changed = true
 	result.FreeRepair = freeRepair
-	result.RepairedEquipmentSlots = []int16{cmd.SlotIndex}
+	result.RepairedEquipmentSlots = append([]int16{cmd.SlotIndex}, result.RepairedEquipmentSlots...)
 	if err := dnfrepo.RecordCharacterGold(ctx, characters, character, dnfrepo.ActivityGoldRepair, result.Cost, character.UpdatedAt); err != nil {
 		return RepairResult{}, err
 	}
@@ -2010,7 +2019,25 @@ func buildCurrentEquipmentRawEntryFromMoveEvidence(
 	equipSlot int16,
 	sourceInstanceValue int32,
 ) ([]byte, bool) {
-	if (sourceListType != wireListMain && sourceListType != wireListAvatar) ||
+	// 邮件等发放路径只有 PVF 身份和品质种子，不一定持久化不透明行。
+	// list 7 仅为匹配颜色穿戴槽的宠装复用同一重建规则，宠物本体仍走专用序列逻辑。
+	petArtifactSource := false
+	if sourceListType == wireListPet && strings.HasPrefix(strings.ToLower(strings.TrimSpace(stack.Extra["pvf_path"])), "equipment/creature/") {
+		switch strings.Trim(strings.ToLower(strings.TrimSpace(stack.Extra["equipment_type"])), "`") {
+		case "[artifact red]":
+			petArtifactSource = equipSlot == 27
+		case "[artifact blue]":
+			petArtifactSource = equipSlot == 28
+		case "[artifact green]":
+			petArtifactSource = equipSlot == 29
+		}
+	}
+	// Granted medals have the same identity evidence, but live in list 38.
+	// Admit only a flag into actor slot 32; the placement validator still
+	// checks the actual PVF type, character ownership and level before save.
+	medalSource := sourceListType == wireListGuildMedal && equipSlot == 32 &&
+		strings.Trim(strings.ToLower(strings.TrimSpace(stack.Extra["equipment_type"])), "`") == "[flag]"
+	if (sourceListType != wireListMain && sourceListType != wireListAvatar && !petArtifactSource && !medalSource) ||
 		stack.ItemID <= 0 || stack.ItemID > int64(^uint32(0)) || stack.Count != 1 ||
 		sourceInstanceValue == 0 || stack.Extra == nil ||
 		!strings.EqualFold(strings.TrimSpace(stack.Extra["item_kind"]), "equipment") ||

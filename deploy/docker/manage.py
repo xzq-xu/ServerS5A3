@@ -17,7 +17,18 @@ RUNTIME = ROOT / "runtime" / "docker"
 IMAGE = "servers5a3-local:dev"
 PROJECT = "servers5a3-local"
 
+BUFF_GROUP_SYNC_KEY = "DNFBRIDGE_BUFF_GROUP_SYNC"
+BUFF_GROUP_CLIENTS = {
+    "69ea3a8b38d70af340baed28ec03e88162e7d3e434f5f99c9d5b71dafc12f544": "on",  # V212
+    "a28601e349a65a1ec0356995b693a326620d81887031c17b76b5b73daaeb5216": "on",  # V213
+    "6402835223a23f9e4300c57c175d1b990b78ab0eecc46bd03fd373d0893e73f4": "on",  # V214
+    "28e04d1d1c148c841318d533ed8ccb3e426ba5a5f24328b3c913b81303b12a84": "on",  # V215
+    "bc613e368e8fd49c50c35163f2ed8a28564fc23342701a5a6c22b839f3bf6b7a": "off",  # legacy v56
+}
+
 RUNTIME_COMPATIBILITY_VALUES = {
+    "DNFBRIDGE_BUFF_GROUP_SYNC": ("off", "on"),
+    "DNFBRIDGE_EXPERIMENTAL_PEAK": ("off", "on"),
     "DNFBRIDGE_MYSQL_INSERT_BATCH": None,
     "DNFBRIDGE_INVENTORY_SAVE_SCOPE": ("collection", "slot"),
     "DNFBRIDGE_EQUIPMENT_SAVE_SCOPE": ("collection", "entry"),
@@ -62,6 +73,33 @@ def runtime_compatibility_env(config):
             raise ValueError(f"runtime_compatibility value is not allowed: {key}={value}")
         validated[key] = value
     return validated
+
+
+def buff_group_sync_env(config, compatibility):
+    mode = config.get("buff_group_sync")
+    if "buff_group_sync" in config and mode not in ("auto", "on", "off"):
+        raise ValueError("buff_group_sync must be auto, on or off")
+    explicit = compatibility.get(BUFF_GROUP_SYNC_KEY)
+    if (mode == "on" or explicit == "on") and config.get("client_version", "official-24.9") != "official-24.9":
+        raise ValueError("buff_group_sync on requires client_version official-24.9")
+    if explicit is not None:
+        if mode in ("on", "off") and mode != explicit:
+            raise ValueError("buff_group_sync conflicts with runtime_compatibility")
+        return explicit
+    if mode != "auto":
+        return mode  # Old instance files retain their unconfigured behavior.
+    if config.get("client_version", "official-24.9") != "official-24.9":
+        return "off"
+    client_dir = config.get("client_dir")
+    if not client_dir:
+        return "on"  # A fresh server-only installation targets the current public client.
+    executable = Path(client_dir) / "DNF.exe"
+    if not executable.is_file():
+        raise ValueError("buff_group_sync auto requires DNF.exe in client_dir; select on for V212+ or off for a legacy client")
+    mode = BUFF_GROUP_CLIENTS.get(digest(executable))
+    if mode is None:
+        raise ValueError("buff_group_sync auto does not recognize DNF.exe; select the verified on/off client protocol explicitly")
+    return mode
 
 
 def run(*args, capture=False):
@@ -137,7 +175,8 @@ def check_network(config):
 
 def prepare(args):
     instance = RUNTIME / "instance.json"
-    if instance.exists():
+    existing = instance.exists()
+    if existing:
         config = json.loads(instance.read_text(encoding="utf-8"))
         if args.host_ip:
             config["host_ip"] = private_ipv4(args.host_ip)
@@ -153,7 +192,15 @@ def prepare(args):
             "client_dir": str(Path(args.client_dir).resolve()) if args.client_dir else "",
             "body_codec": "plaintext", "client_body_codec": "plaintext",
             "default_group_login_only": True,
+            "client_version": "official-24.9",
+            "buff_group_sync": "auto",
         }
+    if getattr(args, "buff_group_sync", None) is not None:
+        config["buff_group_sync"] = args.buff_group_sync
+    compatibility = runtime_compatibility_env(config)
+    buff_group_sync = buff_group_sync_env(config, compatibility)
+    if not existing and config["buff_group_sync"] == "auto":
+        config["buff_group_sync"] = buff_group_sync
     management_token(config)
     private_ipv4(config["host_ip"])
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -202,7 +249,31 @@ def prepare(args):
     print(f"Prepared {catalog['channels']} real channels; configuration: {instance}")
 
 
+def performance_resource_config(config):
+    """Explicit host budget; ordinary small deployments retain their defaults."""
+    c = dict(config)
+    profile = c.get("performance_profile")
+    if profile not in (None, "shared-4c-16g"):
+        raise ValueError("unsupported performance_profile")
+    if profile == "shared-4c-16g":
+        for key, value in {"server_memory_limit": "10g", "go_memory_limit": "8GiB",
+                           "database_memory_limit": "3g", "database_buffer_pool_size": "1g"}.items():
+            c.setdefault(key, value)
+    pool = c.get("database_buffer_pool_size")
+    if pool is not None:
+        def size(value):
+            match = re.fullmatch(r"([1-9][0-9]*)([kmgt]?)(?:i?b)?", str(value).lower())
+            if not match:
+                raise ValueError("invalid database memory size")
+            return int(match[1]) * 1024 ** ("kmgt".find(match[2]) + 1 if match[2] else 0)
+        limit = c.get("database_memory_limit")
+        if limit is None or size(pool) > min(size(limit) * 3 // 5, size(limit) - 256 * 1024**2):
+            raise ValueError("database_buffer_pool_size needs database_memory_limit with working headroom")
+    return c
+
+
 def generate(c, catalog):
+    c = performance_resource_config(c)
     owner_range = c.get("channel_directory_owner_range")
     if "channel_directory_owner_range" in c and owner_range not in ("off", "u8"):
         raise ValueError("channel_directory_owner_range must be off or u8")
@@ -250,6 +321,7 @@ def generate(c, catalog):
     if buff_swap_reapply is not None and buff_swap_reapply not in ("on", "off"):
         raise ValueError("buff_swap_reapply must be 'on' or 'off' when configured")
     compatibility_env = runtime_compatibility_env(c)
+    buff_group_sync = buff_group_sync_env(c, compatibility_env)
     advertised_server = c.get("channel_advertise_server", 0)
     if type(advertised_server) is not int or not 0 <= advertised_server < 250:
         raise ValueError("channel_advertise_server must be an integer from 0 to 249")
@@ -259,11 +331,24 @@ def generate(c, catalog):
     percent = c.get("main_quest_exp_percent")
     if "main_quest_exp_percent" in c and (type(percent) is not int or not 0 <= percent <= 100):
         raise ValueError("main_quest_exp_percent must be an integer from 0 to 100")
+    gold_diagnostic_character = c.get("gold_diagnostic_character")
+    if "gold_diagnostic_character" in c and (
+            type(gold_diagnostic_character) is not int
+            or not 0 <= gold_diagnostic_character <= 2147483647):
+        raise ValueError("gold_diagnostic_character must be an integer from 0 to 2147483647")
+    disjoint_epic_display = c.get("disjoint_epic_display")
+    if "disjoint_epic_display" in c and (
+            type(disjoint_epic_display) is not str
+            or disjoint_epic_display not in ("off", "paired-v1")):
+        raise ValueError("disjoint_epic_display must be off or paired-v1")
+    town_display_only = c.get("town_display_only")
+    if "town_display_only" in c and (type(town_display_only) is not str or town_display_only not in ("off", "on")):
+        raise ValueError("town_display_only must be off or on")
     game_token = management_token(c)
     server = RUNTIME / "server"
     for directory in (server / "logs", server / "configs/dnf", server / "configs/servergroup"):
         directory.mkdir(parents=True, exist_ok=True)
-    dsn = f"dnf:{c['database_password']}@tcp({c['database_ip']}:3306)/dnf_local?parseTime=true&charset=utf8mb4,utf8"
+    dsn = f"dnf:{c['database_password']}@tcp({c['database_ip']}:3306)/dnf_local?parseTime=true&charset=utf8mb4,utf8&interpolateParams=true"
     q = json.dumps
     config = f'''[service]
 name = "dnfbridge"
@@ -306,7 +391,7 @@ store_kind = "memory"
 enabled = true
 mysql_dsn = {q(dsn)}
 mysql_max_open_conns = 32
-mysql_max_idle_conns = 8
+mysql_max_idle_conns = 32
 mysql_conn_max_lifetime_seconds = 300
 shard_id = "9999"
 table_prefix = "dnf"
@@ -360,8 +445,16 @@ create_databases = false
     if percent is not None:
         env["DNFBRIDGE_MAIN_QUEST_EXP_PERCENT"] = str(percent)
     env.update(compatibility_env)
+    if buff_group_sync is not None:
+        env[BUFF_GROUP_SYNC_KEY] = buff_group_sync
     if encoding is not None:
         env["DNFBRIDGE_CHANNEL_SCRIPT_ENCODING"] = encoding
+    if gold_diagnostic_character is not None:
+        env["DNFBRIDGE_GOLD_DIAGNOSTIC_CHARACTER"] = str(gold_diagnostic_character)
+    if disjoint_epic_display is not None:
+        env["DNFBRIDGE_DISJOINT_EPIC_DISPLAY"] = disjoint_epic_display
+    if town_display_only is not None:
+        env["DNFBRIDGE_TOWN_DISPLAY_ONLY"] = town_display_only
     write(RUNTIME / "server.env", "".join(f"{k}={v}\n" for k, v in env.items()))
     write(RUNTIME / "database.env", f"MARIADB_DATABASE=dnf_local\nMARIADB_USER=dnf\nMARIADB_PASSWORD={c['database_password']}\nMARIADB_ROOT_PASSWORD={c['root_password']}\n")
     logging = {"driver": "json-file", "options": {"max-size": "20m", "max-file": "3"}}
@@ -388,6 +481,8 @@ create_databases = false
     }
     if c.get("database_memory_limit"):
         spec["services"]["db"]["mem_limit"] = c["database_memory_limit"]
+    if c.get("database_buffer_pool_size"):
+        spec["services"]["db"]["command"].append("--innodb-buffer-pool-size=" + str(c["database_buffer_pool_size"]))
     for service in spec["services"].values():
         service["restart"] = c.get("restart", "no")
     write(RUNTIME / "compose.json", json.dumps(spec, indent=2) + "\n")
@@ -400,6 +495,8 @@ def main():
     parser.add_argument("--pvf")
     parser.add_argument("--host-ip")
     parser.add_argument("--client-dir")
+    parser.add_argument("--buff-group-sync", choices=("auto", "on", "off"),
+                        help="Fresh installs select V212+ automatically; use off only for a legacy client")
     parser.add_argument("--channel-info", help="Explicit external channel table; preserves the PVF-extracted table")
     parser.add_argument("--runtime-dir", type=Path, default=RUNTIME)
     parser.add_argument("--project", default=PROJECT)

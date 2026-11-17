@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"time"
 
@@ -48,6 +49,7 @@ import (
 
 // Service 是 DNF 最新客户端 bridge 的生命周期组件。
 type Service struct {
+	secretShops           currentSecretShopCatalogState
 	battlePassCatalogMu   sync.Mutex
 	battlePassCatalog     *battlepass.Catalog
 	battlePassFingerprint string
@@ -58,14 +60,18 @@ type Service struct {
 	guildCreateMu                sync.Mutex
 	activityRankService          *activityrank.Service
 	playerStatsQueries           gamePlayerStatsQueries
+	partyNativeAdmission         partyNativeConnectionAdmission
 	channelHandoffMu             sync.Mutex
 	channelHandoffs              map[currentAuthenticatedChannelHandoffKey]*currentAuthenticatedChannelHandoff
 	guildDungeonCatalogMu        sync.Mutex
 	guildDungeonCatalog          *dnfguild.DungeonCatalog
 	guildTeleportMu              sync.Mutex
 	launcherDiagnostics          launcherDiagnosticStore
+	wedding                      currentWeddingRuntime
 	performance                  *bridgePerformanceMetrics
 	guildRankingMu               sync.Mutex
+	guildRankingGate             chan struct{}
+	guildRankingWake             chan struct{}
 	guildRankingCatalogMu        sync.Mutex
 	guildRankingRules            *dnfguild.RankingRules
 	guildEssenceCatalog          *dnfguild.EssenceCatalog                                                    // guarded by guildDungeonCatalogMu
@@ -97,34 +103,38 @@ type Service struct {
 	// 角色开两条传输，见 online_player_manager.go 的 LeaveAreaSession 注释）正是现场
 	// 2026-09-26 的关键形态：目录 owner 那条 socket 关闭时，角色其实还在另一条 socket
 	// 上玩。见 game_sessions.go 的 handoverRuntimePartyToLiveSession。
-	liveGameSessions          map[string]*gameSession
-	nextGameSessionGeneration uint64
-	auctionMaintenanceContext context.Context
-	auctionCategoryExtraOnce  sync.Once
-	auctionCategoryExpertJobs map[uint32][]byte
-	auctionCategoryExtractors map[uint32]bool
-	auctionCategoryExtraErr   error
-	auctionMu                 sync.Mutex
-	auctionItemEligibility    func(uint32) bool
-	auctionCategoryItem       func(uint16, uint32) bool
-	pvpMu                     sync.Mutex
-	pvpRooms                  map[uint16]*currentPVPRoom
-	pvpMatching               []*currentPVPMatchingRequest // protected by pvpMu
-	nextPVPMatchingToken      uint32
-	pvpSubscribers            map[*gameSession]int
-	pvpMapOrder               []int64                 // protected by pvpMu
-	pvpDailyCatalog           *dnfpvp.Catalog         // protected by initialEquipmentMu
-	pvpTotalCatalog           *dnfpvp.Catalog         // protected by initialEquipmentMu
-	pvpFatigueRules           *currentPVPFatigueRules // protected by initialEquipmentMu
-	tradeMu                   sync.Mutex
-	itemTrades                map[uint16]*onlineItemTrade
-	expertJobStoreMu          sync.Mutex
-	expertJobStoreOpMu        sync.Mutex
-	expertJobStores           map[uint16]*currentExpertJobStore
-	expertJobVisitors         map[*gameSession]uint16
-	raidMu                    sync.Mutex
-	raids                     map[uint32]*runtimeRaidState
-	currentRaidDisconnects    map[uint16]currentRaidDisconnectSeat
+	liveGameSessions            map[string]*gameSession
+	nextGameSessionGeneration   uint64
+	auctionMaintenanceContext   context.Context
+	auctionMaintenanceWake      chan struct{}
+	auctionMaintenanceScheduled bool
+	auctionMaintenanceCursor    string
+	auctionCategoryExtraOnce    sync.Once
+	auctionCategoryExpertJobs   map[uint32][]byte
+	auctionCategoryExtractors   map[uint32]bool
+	auctionCategoryExtraErr     error
+	auctionMu                   sync.Mutex
+	auctionItemEligibility      func(uint32) bool
+	auctionCategoryItem         func(uint16, uint32) bool
+	pvpMu                       sync.Mutex
+	pvpRooms                    map[uint16]*currentPVPRoom
+	pvpMatching                 []*currentPVPMatchingRequest // protected by pvpMu
+	nextPVPMatchingToken        uint32
+	pvpSubscribers              map[*gameSession]int
+	pvpMapOrder                 []int64                 // protected by pvpMu
+	pvpDailyCatalog             *dnfpvp.Catalog         // protected by initialEquipmentMu
+	pvpTotalCatalog             *dnfpvp.Catalog         // protected by initialEquipmentMu
+	pvpFatigueRules             *currentPVPFatigueRules // protected by initialEquipmentMu
+	tradeMu                     sync.Mutex
+	itemTrades                  map[uint16]*onlineItemTrade
+	expertJobStoreMu            sync.Mutex
+	expertJobStoreOpMu          sync.Mutex
+	expertJobStores             map[uint16]*currentExpertJobStore
+	expertJobVisitors           map[*gameSession]uint16
+	raidMu                      sync.Mutex
+	raids                       map[uint32]*runtimeRaidState
+	currentRaidDisconnects      map[uint16]currentRaidDisconnectSeat
+	currentRaidRefreshRevision  uint64 // raidMu; orders snapshots before per-owner enqueue
 	// Protected by raidMu; bounds queued deadline cleanup to one worker per runtime.
 	currentRaidDeadlineQueued map[*runtimeDungeonState]bool
 	currentRaidApplications   map[uint16]currentRaidApplication
@@ -135,6 +145,7 @@ type Service struct {
 	antonRewardWorkRunning    bool
 	nextRaidSeq               uint32
 	packetLog                 *packetLogger
+	packetLogDisabled         atomic.Bool
 	partyUDPRelay             *currentPartyUDPRelay
 	// partyUDPRelayRemote 是 remote 档（厂商架构）的控制通道客户端：
 	// 注册到独立进程 a21-relay 换取端口矩阵，本进程不 bind 任何中继 UDP 端口。
@@ -183,6 +194,14 @@ type Service struct {
 
 	initialEquipmentMu      sync.Mutex
 	initialEquipmentArchive *platformpvf.Archive
+	// PVF archives are immutable for this Service. Activity visibility still
+	// checks its live switch on every request; resource validation runs once.
+	epicRoadValidationOnce  sync.Once
+	epicRoadValidationOK    bool
+	lukeVisibilityOnce      sync.Once
+	lukeVisibilityErr       error
+	fiendWarVisibilityOnce  sync.Once
+	fiendWarVisibilityErr   error
 	initialEquipmentByJob   map[byte][]initialEquipmentEntry
 	initialEquipmentLoadErr error
 	// dungeonRuleSource lets focused tests provide the exact approved PVF texts
@@ -190,6 +209,8 @@ type Service struct {
 	dungeonRuleSource         initialEquipmentTextSource
 	weeklyCatalogMu           sync.Mutex
 	weeklyCatalog             *onlineevent.WeeklyCatalog
+	ordinaryCatalogMu         sync.Mutex
+	ordinaryCatalog           *onlineevent.OrdinaryCatalog
 	attendanceMarbleMu        sync.Mutex
 	attendanceMarbleCatalog   *attendanceMarbleCatalog
 	monthlyCatalogMu          sync.Mutex
@@ -305,6 +326,7 @@ type Service struct {
 	dungeonHellPartyTable *pvfDungeonHellPartyCatalog
 	dungeonChoice         func(int) (int, error)
 	dungeonSeed           func() (uint32, error)
+	gameplayTimersMu      sync.Mutex
 	gameplayTimers        gameplayTimeQueue
 	repositoryProvider    func() (dnfrepo.Group, bool)
 	initialTownEntryWait  func(time.Duration)
@@ -399,6 +421,7 @@ func (s *Service) Start(ctx context.Context) error {
 	s.channelScript = append([]byte(nil), channelScript...)
 	s.cancel = cancel
 	s.packetLog = packetLog
+	s.packetLogDisabled.Store(packetLog == nil)
 	if s.initialTownEntryWait == nil {
 		// Initial-town visual delay is disabled. Production never blocks the
 		// server packet stream at the retained test boundary.
@@ -444,6 +467,7 @@ func (s *Service) Start(ctx context.Context) error {
 			s.catalog = nil
 			s.cancel = nil
 			s.packetLog = nil
+			s.packetLogDisabled.Store(true)
 			s.mu.Unlock()
 			return errors.Join(err, closeErr)
 		}
@@ -458,6 +482,7 @@ func (s *Service) Start(ctx context.Context) error {
 		s.catalog = nil
 		s.cancel = nil
 		s.packetLog = nil
+		s.packetLogDisabled.Store(true)
 		s.mu.Unlock()
 		return errors.Join(fmt.Errorf("dnfbridge has no game listen ports"), closeErr)
 	}
@@ -469,6 +494,7 @@ func (s *Service) Start(ctx context.Context) error {
 		s.catalog = nil
 		s.cancel = nil
 		s.packetLog = nil
+		s.packetLogDisabled.Store(true)
 		s.mu.Unlock()
 		return errors.Join(err, closeErr)
 	}
@@ -477,6 +503,7 @@ func (s *Service) Start(ctx context.Context) error {
 	s.partyUDPRelayRemote = partyRelayRemote
 	s.mu.Unlock()
 
+	s.startCurrentWeddingCeremonyTimers()
 	if err := s.listen(runCtx, s.options.channelListen, s.handleChannelConn); err != nil {
 		cancel()
 		_ = s.closePartyUDPRelayBackends()
@@ -485,6 +512,7 @@ func (s *Service) Start(ctx context.Context) error {
 		s.catalog = nil
 		s.cancel = nil
 		s.packetLog = nil
+		s.packetLogDisabled.Store(true)
 		s.partyUDPRelay = nil
 		s.partyUDPRelayRemote = nil
 		s.mu.Unlock()
@@ -847,6 +875,7 @@ func gameListenAddress(host string, port int) string {
 // Stop 关闭监听并等待连接处理退出。
 func (s *Service) Stop(ctx context.Context) error {
 	s.stopLocalLoginTokens()
+	s.stopCurrentWeddingCeremonyTimers()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -863,6 +892,7 @@ func (s *Service) Stop(ctx context.Context) error {
 	s.listeners = nil
 	s.cancel = nil
 	s.packetLog = nil
+	s.packetLogDisabled.Store(true)
 	s.partyUDPRelay = nil
 	s.partyUDPRelayRemote = nil
 	s.channelScript = nil
@@ -954,14 +984,26 @@ func (s *Service) loadChannelAssets() (*channelcatalog.Catalog, []byte, error) {
 }
 
 func (s *Service) buildChannelScript(raw []byte) ([]byte, error) {
+	index, err := channelinfo.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := channelcatalog.New(index, channelcatalog.Options{ServerID: s.channelServerID()})
+	if err != nil {
+		return nil, err
+	}
+	bootstrap, ok := catalog.BootstrapChannel(dnfenum.BootstrapChannelID)
+	if !ok {
+		return nil, fmt.Errorf("%w: no configured bootstrap or ordinary channel", channelcatalog.ErrEmpty)
+	}
 	if s.options.currentClientVersion == "official-24.9" {
-		return channelinfo.BuildOfficial249OnlineScript(raw, s.channelServerID(), s.channelAdvertiseID(), dnfenum.BootstrapChannelID)
+		return channelinfo.BuildOfficial249OnlineScript(raw, s.channelServerID(), s.channelAdvertiseID(), bootstrap.ID)
 	}
 	return channelinfo.Build90CNOnlineScript(
 		raw,
 		s.channelServerID(),
 		s.channelAdvertiseID(),
-		dnfenum.BootstrapChannelID,
+		bootstrap.ID,
 	)
 }
 
@@ -1010,6 +1052,9 @@ func (s *Service) openPacketLog() (*packetLogger, error) {
 }
 
 func (s *Service) logPacket(direction string, kind string, data []byte, fields ...any) {
+	if s.packetLogDisabled.Load() {
+		return
+	}
 	if suppressPacketLogLine(direction, kind, fields...) {
 		return
 	}
@@ -1020,6 +1065,9 @@ func (s *Service) logPacket(direction string, kind string, data []byte, fields .
 }
 
 func (s *Service) logPacketEvent(kind string, args ...any) {
+	if s.packetLogDisabled.Load() && !packetEventHasDiagnostic(kind) {
+		return
+	}
 	if suppressPacketLogEvent(kind, args...) {
 		return
 	}
@@ -1027,6 +1075,7 @@ func (s *Service) logPacketEvent(kind string, args ...any) {
 	logger := s.packetLog
 	s.mu.Unlock()
 	if logger == nil {
+		s.logDungeonDeathTimingDiagnostic(kind, args...)
 		s.logTownLoadingDiagnostic(kind, args...)
 		s.logEmpireTeamSetupDiagnostic(kind, args...)
 		s.logDungeonSettlementDiagnostic(kind, args...)
@@ -1089,7 +1138,7 @@ func suppressPacketLogEvent(kind string, fields ...any) bool {
 
 func packetLogUintField(fields []any, name string) (uint64, bool) {
 	for i := 0; i+1 < len(fields); i += 2 {
-		if fmt.Sprint(fields[i]) != name {
+		if key, ok := fields[i].(string); !ok || key != name {
 			continue
 		}
 		switch v := fields[i+1].(type) {

@@ -38,6 +38,10 @@ func currentCrossSceneProfileErrorKind(err error) string {
 }
 
 func (s *Service) sendCurrentPartyCrossSceneProfiles(snapshot party.RuntimePartySnapshot) {
+	s.sendCurrentPartyCrossSceneProfilesForReceiver(snapshot, nil)
+}
+
+func (s *Service) sendCurrentPartyCrossSceneProfilesForReceiver(snapshot party.RuntimePartySnapshot, only *gameSession) {
 	if s.options.currentClientVersion != "official-24.9" || len(snapshot.Members) < 2 {
 		return
 	}
@@ -47,6 +51,9 @@ func (s *Service) sendCurrentPartyCrossSceneProfiles(snapshot party.RuntimeParty
 	for _, member := range snapshot.Members {
 		viewer, ok := s.onlineGameSessionCharacterSnapshot(member.UserID)
 		if !ok || viewer.generation != member.SessionGeneration {
+			continue
+		}
+		if only != nil && viewer.session != only {
 			continue
 		}
 		for _, peer := range snapshot.Members {
@@ -76,7 +83,14 @@ func (s *Service) currentCrossSceneRaidPair(state runtimeRaidState, viewer, acto
 }
 
 func (s *Service) sendCurrentRaidCrossSceneProfiles(batch *currentCrossSceneProfileBatch, viewer *gameSession, state runtimeRaidState) {
+	s.sendCurrentRaidCrossSceneProfilesForActors(batch, viewer, state, nil)
+}
+
+func (s *Service) sendCurrentRaidCrossSceneProfilesForActors(batch *currentCrossSceneProfileBatch, viewer *gameSession, state runtimeRaidState, actors map[uint16]bool) {
 	for _, member := range state.Members {
+		if actors != nil && !actors[member.CharID] {
+			continue
+		}
 		actor, ok := s.onlineGameSession(member.CharID)
 		if !ok || !s.currentCrossSceneRaidPair(state, viewer, actor) {
 			continue

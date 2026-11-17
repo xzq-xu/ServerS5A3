@@ -36,6 +36,9 @@ var (
 )
 
 type runtimeDungeonState struct {
+	ekernDiagnostic                          *ekernDiagnosticBudget
+	pendingDeathPreparations                 map[uint32]*pendingDungeonDeathPreparation
+	guildDungeonKills                        *currentGuildDungeonKillPlan
 	monsterAdventureInfoPending              bool // committed EXP; UI roster waits until after room death notifications
 	partyExperienceReceipts                  map[currentPartyMonsterExperienceReceipt]bool
 	battlePassSkillSequence                  uint64
@@ -71,6 +74,7 @@ type runtimeDungeonState struct {
 	semesterRun                              *currentSemesterRun
 	epicEntry                                *currentEpicEntry
 	raidEntry                                *currentRaidDungeonEntry
+	raidTablePartyReturn                     *currentRaidTablePartyReturn
 	fiendWarRetreatKeepsParty                bool
 	antonMapReturnOwner                      *currentAntonMapReturnOwner
 	lukeClosedEnergyReturn                   *currentLukeClosedEnergyReturnOwner
@@ -128,6 +132,8 @@ type runtimeDungeonState struct {
 	HellPartyDifficulty     byte
 	HellPartyStarted        bool
 	epicShop                *currentEpicShop
+	secretShop              *currentSecretShop
+	secretShopChecked       bool
 	epicShopChecked         bool
 	hellEntryItemsCommitted bool
 	// hellPillarPeerDestroyKey 记录"柱子破坏已经投影给队友"的那个房间
@@ -1076,6 +1082,7 @@ func (s *Service) commitDungeonRuntimeWithPetClock(session *gameSession, runtime
 	runtime.ridableReportChannelID = session.channel.ID
 	runtime.ridableReportChannelType = session.channel.Type
 	session.dungeon.runtime = runtime
+	setCurrentAikenSupportTitleProjection(session, runtime)
 	// 阶段二：同一队伍的成员进图时解析到同一个实例键（队伍+副本+迷宫+房间+地图+种子）
 	// 就接入同一个共享实例；单人/无队伍/房间对不上时返回 nil，per-session 路径不变。
 	// 这里只改共享对象归属，不额外发包，op24/op29 的既有顺序不受影响。

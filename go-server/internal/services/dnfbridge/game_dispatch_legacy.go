@@ -5,11 +5,17 @@ import (
 	dnfproto "longheng.io/server/internal/modules/dnf/protocol"
 )
 
-func (s *Service) handleLegacyGamePacket(session *gameSession, raw []byte) error {
+func (s *Service) handleLegacyGamePacket(session *gameSession, raw []byte) (resultErr error) {
 	packet, err := dnfproto.ParseLegacyGamePacket(raw)
 	if err != nil {
 		return err
 	}
+	started := s.performanceStart()
+	stage := perfLegacyOther
+	if packet.Header.Cmd == 1 && packet.Header.Type == 39 {
+		stage = perfUpper39
+	}
+	defer func() { s.performanceUpperEnd(stage, packet.Header.Type, packet.Header.Cmd, started, resultErr) }()
 	body := normalizeLegacyGameBody(packet.Header.Type, packet.Body)
 	runtimeName := runtimeCmdPacketName(packet.Header.Cmd, packet.Header.Type)
 	runtimeKnown := runtimeCmdPacketKnown(packet.Header.Cmd, packet.Header.Type)
@@ -162,6 +168,12 @@ func (s *Service) handleGameCommandRequest(session *gameSession, request gamepla
 	if typ == privateActivityOpcode {
 		return s.handlePrivateActivity(session, cmd, body)
 	}
+	if typ == privateClientFeaturesOpcode {
+		return s.handlePrivateClientFeatures(session, cmd, body)
+	}
+	if typ == privateGrowthOpcode {
+		return s.handlePrivateGrowth(session, cmd, body)
+	}
 	if typ == privateFestivalOpcode {
 		return s.handlePrivateFestival(session, cmd, body)
 	}
@@ -183,6 +195,12 @@ func (s *Service) handleGameCommandRequest(session *gameSession, request gamepla
 	}
 	if typ == playerStatsGameOpcode {
 		return s.handlePlayerStatsGame(session, body)
+	}
+	if typ == partyNativeConnectionOpcode {
+		return s.handlePartyNativeConnectionReply(session, body)
+	}
+	if typ == dungeonPeerNativeRegistrationOpcode {
+		return s.handleDungeonPeerNativeRegistrationReply(session, body)
 	}
 	if s.options.currentClientVersion == "official-24.9" && typ == official249PrevVillageCmdID {
 		return s.handleCurrentPrevVillage(session, body)
@@ -436,6 +454,7 @@ func (s *Service) handleGameCommandRequest(session *gameSession, request gamepla
 // **今天这条完全相同的路**（同样的 aligned pending-module 证据 + 零回包），
 // 而不是另写一份"看起来像"的静默分支。
 func (s *Service) handleGameLegacyFallbackCommand(session *gameSession, cmd byte, typ uint16, body []byte) error {
+	s.observeCurrentLegacyPeerResult(session, cmd, typ, body)
 	if handled, err := s.handleAlignedGameCommand(session, cmd, typ, body); handled || err != nil {
 		return err
 	}

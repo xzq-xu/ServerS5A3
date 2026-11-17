@@ -29,6 +29,7 @@ type runtimeRaidBattle struct {
 	LukeMemberRoutes       map[uint16]currentLukeMemberRoute
 	LukeSanctumMazeGroup   *currentLukeSanctumMazeGroup
 	InstanceID             string
+	EntryDebit             *raid.EntryDebit
 	Mode                   byte
 	ChannelID              int
 	ChannelType            byte
@@ -68,6 +69,9 @@ type runtimeRaidBattle struct {
 	RewardCards          [2]map[uint16]*currentAntonRewardCard
 	AntonFlowConfig      raid.AntonFlowConfiguration
 	RewardFlow           [2]*currentAntonRewardFlow
+
+	RewardFreezeDiagnosticAt         [2]time.Time
+	RewardFreezeDiagnosticSuppressed [2]uint32
 }
 
 func cloneRuntimeRaidBattle(b *runtimeRaidBattle) *runtimeRaidBattle {
@@ -75,6 +79,10 @@ func cloneRuntimeRaidBattle(b *runtimeRaidBattle) *runtimeRaidBattle {
 		return nil
 	}
 	v := *b
+	if b.EntryDebit != nil {
+		debit := *b.EntryDebit
+		v.EntryDebit = &debit
+	}
 	v.FiendWar = b.FiendWar.Clone()
 	v.FiendWarMaps = map[string]map[int64]bool{}
 	for run, rows := range b.FiendWarMaps {
@@ -245,7 +253,7 @@ func (s *Service) prepareCurrentRaidBattle(session *gameSession, state runtimeRa
 			peer, found = session, true
 		}
 		if !found || !s.currentRaidAuthenticated(peer) || peer.channel.ID != session.channel.ID || peer.channel.Type != session.channel.Type {
-			return nil, fmt.Errorf("raid battle member is not authenticated in this channel: %d", member.CharID)
+			return nil, &raidStartRejection{message: "队员尚未在线归队或不在同一频道，请确认后重试", members: []uint16{member.CharID}}
 		}
 		character, found, err := repos.Character.Load(ctx, strconv.Itoa(int(member.CharID)))
 		if err != nil {
@@ -261,7 +269,7 @@ func (s *Service) prepareCurrentRaidBattle(session *gameSession, state runtimeRa
 			return nil, err
 		}
 		if used >= config.WeeklyClearLimit {
-			return nil, raid.ErrWeeklyClearLimit
+			return nil, &raidStartRejection{message: "队员本周攻坚通关次数已达上限", members: []uint16{member.CharID}, cause: raid.ErrWeeklyClearLimit}
 		}
 		if member.CharID == state.LeaderID {
 			leaderUsed = used
@@ -332,7 +340,7 @@ func (s *Service) prepareCurrentRaidBattle(session *gameSession, state runtimeRa
 		if err != nil {
 			return nil, err
 		}
-		catalog, err := newPVFDungeonDropCatalog(archive)
+		catalog, err := s.currentPVFItemCatalog()
 		if err != nil {
 			return nil, err
 		}
@@ -349,7 +357,7 @@ func (s *Service) prepareCurrentRaidBattle(session *gameSession, state runtimeRa
 		if err != nil {
 			return nil, err
 		}
-		catalog, err := newPVFDungeonDropCatalog(archive)
+		catalog, err := s.currentPVFItemCatalog()
 		if err != nil {
 			return nil, err
 		}
@@ -369,7 +377,7 @@ func (s *Service) prepareCurrentRaidBattle(session *gameSession, state runtimeRa
 		if err != nil {
 			return nil, err
 		}
-		rewardCatalog, err := newPVFDungeonDropCatalog(archive)
+		rewardCatalog, err := s.currentPVFItemCatalog()
 		if err != nil {
 			return nil, err
 		}
@@ -396,7 +404,7 @@ func (s *Service) prepareCurrentRaidBattle(session *gameSession, state runtimeRa
 		if err != nil {
 			return nil, err
 		}
-		catalog, err := newPVFDungeonDropCatalog(archive)
+		catalog, err := s.currentPVFItemCatalog()
 		if err != nil {
 			return nil, err
 		}

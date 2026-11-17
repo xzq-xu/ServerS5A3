@@ -25,6 +25,13 @@ MARKER = "<!-- client-release-sync:v1 "
 TAG = re.compile(r"client-[A-Za-z0-9][A-Za-z0-9._-]{0,120}\Z")
 VERSION_TAG = re.compile(r"client-v([1-9][0-9]*)(?:-[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
 MIN_CLIENT_VERSION = 180
+NATIVE_CLIENT_EXE = {"sha256": "6402835223a23f9e4300c57c175d1b990b78ab0eecc46bd03fd373d0893e73f4", "length": 112812032}
+FORMAL_BLACKDIAMOND_EXE = {"sha256": "28e04d1d1c148c841318d533ed8ccb3e426ba5a5f24328b3c913b81303b12a84", "length": 112816128}
+NATIVE_CLIENT_SIDECARS = {
+    "CombatPower.dll": {"sha256": "140ff544f282e401801a5d46d067a74867b43a2ecce7d89b5abe065a00a59f77", "length": 706048},
+    "DpsMeter.dll": {"sha256": "6e907abd58551c06e58242d31e4a8a62c57d7d2440d88b7184f9844c34be5a17", "length": 493056},
+    "ImagePacks2/sprite_interface_private_features20261113.NPK": {"sha256": "fc8d96ccb192e3bdaed211b2bfb81a59ee96daab50e9d69e495766019c56ac42", "length": 125034},
+}
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,150}\.zip\Z", re.I)
 SPLIT_NAME = re.compile(r"([A-Za-z0-9][A-Za-z0-9._-]{0,150}\.zip)\.([0-9]{3})\Z", re.I)
 
@@ -200,6 +207,7 @@ def inspect_zip(path, *, with_pvf=False):
             names = set()
             exe = None
             pvf = None
+            native_sidecars = set()
             total = 0
             for entry in z.infolist():
                 raw_name = entry.orig_filename
@@ -226,6 +234,17 @@ def inspect_zip(path, *, with_pvf=False):
                         for block in iter(lambda: stream.read(1024 * 1024), b""):
                             h.update(block)
                     exe = {"sha256": h.hexdigest(), "length": entry.file_size}
+                elif raw_name in NATIVE_CLIENT_SIDECARS:
+                    expected = NATIVE_CLIENT_SIDECARS[raw_name]
+                    if entry.file_size != expected["length"]:
+                        raise SyncError("Native client sidecar length differs")
+                    h = hashlib.sha256()
+                    with z.open(entry) as stream:
+                        for block in iter(lambda: stream.read(1024 * 1024), b""):
+                            h.update(block)
+                    if h.hexdigest() != expected["sha256"]:
+                        raise SyncError("Native client sidecar digest differs")
+                    native_sidecars.add(raw_name)
                 elif with_pvf and raw_name == "client/Script.pvf":
                     if entry.file_size == 0:
                         raise SyncError("Empty client PVF")
@@ -245,6 +264,10 @@ def inspect_zip(path, *, with_pvf=False):
                             pass
             if exe is None:
                 raise SyncError("Client ZIP has no DNF.exe")
+            if ((native_sidecars or exe in (NATIVE_CLIENT_EXE, FORMAL_BLACKDIAMOND_EXE)) and
+                    (native_sidecars != set(NATIVE_CLIENT_SIDECARS) or
+                     exe not in (NATIVE_CLIENT_EXE, FORMAL_BLACKDIAMOND_EXE))):
+                raise SyncError("Native client bundle must match the complete exact EXE/plugin/skin set")
             if with_pvf:
                 if pvf is None:
                     raise SyncError("Split client ZIP has no PVF")
@@ -382,6 +405,27 @@ class Repository:
     def get(self, tag):
         prefix = "/releases/tags/" if self.provider == "github" else "/releases/"
         return self.api(prefix + urllib.parse.quote(tag, safe=""), missing=True)
+
+    def refresh_latest(self, apply=False):
+        """Select the highest published stable client, independent of import order."""
+        if self.provider != 'github' or not self.writable:
+            return None
+        candidates = [r for r in self.list() if VERSION_TAG.fullmatch(r['tag_name'])
+                      and not r.get('draft') and not r.get('prerelease')
+                      and any((NAME.fullmatch(a['name']) or SPLIT_NAME.fullmatch(a['name'])) and a.get('size', 0) > 0
+                              and a.get('state', 'uploaded') == 'uploaded' for a in r.get('assets', []))]
+        if not candidates:
+            return None
+        candidate = max(candidates, key=lambda r: (int(VERSION_TAG.fullmatch(r['tag_name'])[1]),
+                                                   r.get('published_at', ''), r['id']))
+        current = self.api('/releases/latest', missing=True)
+        changed = current is None or current['id'] != candidate['id']
+        if apply and changed:
+            self.api(f"/releases/{candidate['id']}", method='PATCH', body={'make_latest':'true'})
+            if self.api('/releases/latest')['id'] != candidate['id']:
+                raise SyncError('Latest release readback differs')
+        return dict(tag=candidate['tag_name'], previous=current.get('tag_name') if current else None,
+                    changed=changed, applied=bool(apply and changed))
 
     def tag_commit(self, tag):
         if self.provider != "github":
@@ -720,7 +764,10 @@ def main():
             receipt["completed"].append({"target":repo.key,"tag":item["tag"],"verified":True})
             save_receipt(args.receipt,receipt)
             print(f"Published and verified {repo.key}: {item['tag']}",flush=True)
-    print(json.dumps({"planned":len(actions),"completed":len(receipt['completed'])}))
+    # Also repair metadata on a no-op sync. No asset transfer is needed here.
+    receipt['latest'] = repos[1].refresh_latest(apply=args.apply)
+    save_receipt(args.receipt, receipt)
+    print(json.dumps({"planned":len(actions),"completed":len(receipt['completed']), 'latest':receipt['latest']}))
 
 
 if __name__=="__main__":

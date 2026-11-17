@@ -1,4 +1,16 @@
+## 2026-11-15 日常 CI 精简为持续工作约定
+
+日常修复选择相关包，bridge指定明确 `--run`，默认Go缓存；数据库/PVF、外部状态、时间或并发复现需新执行时才fresh。保留受影响调用方、list/test/vet、边界、依赖及完整Linux正式构建；纯文档/工具按自身范围检查。主干累计后审查新增diff，只补受影响验证；新quick声明绑定当前精确SHA并引用未变证据。必要检查通过且无新变更/失败/未决疑点时，不继续无理由重复或扩大。full/race按影响使用；prepare不重复贡献测试。入口、参数与证据规则见 [本地验证与精简发布载荷](Docs/LOCAL_CICD.md)。本条替代更早日常强制无缓存全量、主干任意前进就全量重测的做法。
+
+## 2026-11-05 可信开发者 quick
+
+仓库负责人已批准Cec1c、16www两位写权限开发者使用 `SOURCE_MERGE.bat --quick`，以绑定精确SHA的本地通过文字声明取得 `merge-ready` 合入资格，跳过远端CI等待。普通外部PR继续走CI；声明记为local-attested，不伪称cloud CI已通过。多个小修复合批验证，源码累计后直接prepare。详见 `Docs/TRUSTED_QUICK_MERGE.md`；私有入口支持 `GAME_UPDATE_REMOTE.bat prepare --quick` 串接公开合入/私有累计。备份完成后才交扳机，触发后不再准备；从决定部署到结果告知记录整轮时间。
+
 # DNF90 Project Working Agreement
+
+## 2026-11-04 合批 CI 与接收端验哈
+
+遵循 [合批发布规则](Docs/PUBLICATION_BATCHING.md)：已完成的小修复尽量合入一个累计 PR，保留各自提交与记录，最终 ready 组合跑一次完整 CI；Draft 只做范围检查，手动分支 CI 保留。部署不重跑完整测试。程序、资源及回退准备提前完成，接收端计算 SHA256 后只返回小回执，禁止将整包搬回开发机仅为验哈。相同不可变对象复用，切换不传大文件；本条替代下文旧重复拉取/全量回传要求。
 
 ## 2026-11-02 GitHub 权威与 Linux CI（替代旧 GitGud 权威/Windows 门禁）
 
@@ -81,17 +93,22 @@
 
 ## Validation commands
 
-Run from `go-server`:
+- 日常本地验证按改动与依赖选择领域包，bridge 指定能覆盖原问题的 `-run`，加相关 vet 和 Linux server 构建。默认使用 Go 测试缓存；真实数据库、外部资源、时间/并发复现或明确需要新执行时加 `-count=1`。`-run` 减少执行的用例，不缩小 Go 的 package 编译单位。
+- Windows 开发机的 Linux 构建/测试使用 Docker；不启动或借用 Kali。`LOCAL_VERIFY.bat` 直接只读挂载源码，共享命名 Go 缓存卷，不为验证打全仓 tar。见 [本地验证与精简载荷](Docs/LOCAL_CICD.md)。
+- 新的独立纯逻辑/SQL/编解码测试优先放在所属小包；需要 bridge 会话/协议集成的回归保留在 bridge，不为目录拆分扩大修改。
+- 仓储契约、事务/锁、会话排序、公共依赖或跨领域改造扩大相关验证，必要时执行全量。普通单点修复不固定重跑全部领域、bridge 和部署脚本；云端现有完整检查与手动全量入口保留。
+- 主干前进后实际 merge/rebase 并审查累计 diff。纯文档变化且运行输入不变可沿用原测试证据；代码变化按依赖补受影响检查。新 READY 绑定新 SHA，引用旧测试与新增检查，不声称旧 READY 验证了新 SHA；文件不相交不等于语义无依赖。
+
+在干净已提交工作树运行（输出目录每次独立）：
 
 ```text
-gofmt -w <changed-go-files>
-go list -buildvcs=false ./...
-go test -buildvcs=false -count=1 ./internal/modules/dnf/...
-go test -buildvcs=false -count=1 ./internal/services/dnfbridge
-go test -buildvcs=false -count=1 ./cmd/server/control
-go vet ./cmd/server/control ./cmd/server/dnf90 ./cmd/server/doctor ./internal/app/dnf90 ./internal/services/dnfbridge
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -buildvcs=false -o ../runtime/bin/DNF90Server ./cmd/server/dnf90
+LOCAL_VERIFY.bat --package ./internal/modules/dnf/inventory/... --output runtime/verify/inventory-01
+LOCAL_VERIFY.bat --package ./internal/services/dnfbridge --run "TestAuction" --output runtime/verify/auction-01
+LOCAL_VERIFY.bat --package ./internal/modules/dnf/repository/mysql --race --uncached --output runtime/verify/mysql-01
+LOCAL_VERIFY.bat --full --output runtime/verify/full-01
 ```
+
+改 Go 文件先 `gofmt`。仅文档/工具变化运行相应校验，不触发 Go 全量。Linux CI 的 `sh scripts/ci/test_core.sh` 仍执行原完整范围，默认允许测试缓存；`GO_TEST_UNCACHED=1` 可强制新执行。prepare 仍只做最新权威源码新构建，不重复贡献测试。
 
 Run deployment preflight without a database:
 

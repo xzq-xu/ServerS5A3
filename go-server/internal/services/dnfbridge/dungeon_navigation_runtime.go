@@ -209,6 +209,14 @@ func (s *Service) handleDungeonSelectUpperPlannedForAdmission(
 	routed *partyDungeonEntryRoutedRequest,
 	admitted bool,
 ) error {
+	return s.handleDungeonSelectUpperPlannedWithNativeAdmission(session, body, prepared, fanoutParty, routed, admitted, nil)
+}
+
+func (s *Service) handleDungeonSelectUpperPlannedWithNativeAdmission(
+	session *gameSession, body []byte, prepared *runtimePartyPreparedDungeonEntry,
+	fanoutParty bool, routed *partyDungeonEntryRoutedRequest, admitted bool, nativeProof *partyNativeConnectionProof,
+) error {
+	var nativeAdmissionDeferred bool
 	var fiendWarSelectionDiagnostic *currentFiendWarAdmissionDiagnostic
 	if prepared != nil && (prepared.session != session || prepared.current == nil || !prepared.current()) {
 		return errors.New("prepared party dungeon entry no longer owns this character or membership")
@@ -288,6 +296,9 @@ func (s *Service) handleDungeonSelectUpperPlannedForAdmission(
 	// 令牌 ⇒ 一包不发。这样就不必依赖"每个 return 点都记得应答"这种枚举。
 	if routed != nil {
 		defer func() {
+			if nativeAdmissionDeferred {
+				return
+			}
 			fallbackCtx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
 			defer cancel()
 			s.answerRoutedPartyEntryOwnerOnRefusal(
@@ -469,6 +480,16 @@ func (s *Service) handleDungeonSelectUpperPlannedForAdmission(
 		s.dispatchRoutedPartyEnterAsLeader(leaderSession, session, body, routedRequest)
 		return nil
 	}
+	if prepared == nil && fanoutParty {
+		var admissionErr error
+		nativeAdmissionDeferred, admissionErr = s.deferPartyNativeConnectionAdmission(session, body, partyStateAtRequest, routed, admitted, nativeProof)
+		if admissionErr != nil {
+			return s.refusePartyNativeConnectionAdmission(session, body, partyStateAtRequest, routed, admissionErr)
+		}
+		if nativeAdmissionDeferred {
+			return nil
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
 	defer cancel()
 	if prepared == nil {
@@ -607,6 +628,11 @@ func (s *Service) handleDungeonSelectUpperPlannedForAdmission(
 			"maze_index", runtime.MazeIndex)
 	}
 	if prepared == nil {
+		// Recheck immediately before the first entry asset mutation. Repository
+		// preflight can outlive the reply or race a town leave/leader handoff.
+		if nativeProof != nil && !s.partyNativeProofCurrent(nativeProof) {
+			return s.refusePartyNativeConnectionAdmission(session, body, partyStateAtRequest, routed, errors.New("native connection proof changed before entry commit"))
+		}
 		if err := s.commitCurrentGuildDungeonEntryFatigue(ctx, session, runtime, scene, preparedFollowers); err != nil {
 			return s.refuseDungeonSelectEntryValidation(session, request, err)
 		}
@@ -686,6 +712,14 @@ func (s *Service) handleDungeonSelectUpperPlannedForAdmission(
 		}
 	}
 	resetDungeonEntrySceneGates(session)
+	if runtime.antonHatcheryTransfer != nil {
+		// The energy scene consumed the previous selector context. A warp
+		// replaces that scene without the ordinary town-return invalidation,
+		// so its old successful op27 cannot authorize this hatchery's entry.
+		// Keep the request/ACK and frozen return origin; renew only the page
+		// context after the replacement runtime has actually committed.
+		session.enterSelectDungeonContextSent = false
+	}
 	if err := s.sendCurrentSceneOp9PreviewActorRemovalOnce(session, "select_dungeon_after_runtime_commit_before_op27"); err != nil {
 		return err
 	}
@@ -955,6 +989,9 @@ func (s *Service) sendPartyDungeonEntryTailAfterOp28(
 			s.logDungeonEntryStepFailure(session, "send_op679_hell_party_monster_info", prepared, err)
 			return err
 		}
+	}
+	if err := s.sendCurrentGuildDungeonRepeatRewardOnEntry(session, runtime); err != nil {
+		return err
 	}
 	// 无论 op29 是否发出，这一句都必须执行：它是 actor `objectKey` 在**运行时**的绑定
 	// （`session.BindHostileObject` + `monsters[].State = announced`），op39 的 owner 校验
@@ -1302,6 +1339,7 @@ func (s *Service) rollbackRuntimePartyPreparedFollowers(prepared []*runtimeParty
 		petClockRolledBack := false
 		if member.session.dungeon.runtime == member.runtime {
 			member.session.dungeon.runtime = nil
+			setCurrentAikenSupportTitleProjection(member.session, nil)
 			s.releasePartyDungeonInstance(member.runtime, member.session.selectedCharacterID, "party_entry_rollback")
 			if dungeonRuntimeOwnsCharacter(member.runtime, member.session.selectedCharacterID) {
 				if err := queueCurrentPetGrowthClockTransition(member.session, currentPetGrowthClockTown, s.gameplayNow(), "party_entry_rollback"); err != nil {
@@ -1688,6 +1726,7 @@ func (s *Service) handleDungeonMoveMapPlanned(
 	fanoutParty bool,
 ) error {
 	if len(body) != dungeoncmd.MoveMapRequestSize {
+		s.logEkernRejectedRequestDiagnostic(session, body, "move", "move_boundary_rejected")
 		s.logGameEvent(session, "game-dungeon-move-blocked",
 			"body_len", len(body),
 			"expected_body_len", dungeoncmd.MoveMapRequestSize,
@@ -1697,6 +1736,7 @@ func (s *Service) handleDungeonMoveMapPlanned(
 	}
 	request, err := dungeoncmd.DecodeMoveMapRequest(body)
 	if err != nil {
+		s.logEkernRejectedRequestDiagnostic(session, body, "move", "move_decode_rejected")
 		s.logGameEvent(session, "game-dungeon-move-blocked",
 			"body_len", len(body),
 			"reason", "current_exe_op45_request_malformed",
@@ -1708,6 +1748,7 @@ func (s *Service) handleDungeonMoveMapPlanned(
 	}
 	if fanoutParty && partyPlan == nil {
 		if err := s.preflightRuntimePartyRoomOwners(session, request); err != nil {
+			s.logEkernRejectedRequestDiagnostic(session, body, "move", "party_room_owner_preflight_rejected")
 			s.logGameEvent(session, "game-dungeon-move-blocked",
 				"next_x", request.NextX, "next_y", request.NextY,
 				"reason", "party_member_room_owner_preflight_failed", "error", err)
@@ -1862,7 +1903,7 @@ func (s *Service) handleDungeonMoveRequestLocked(
 	requestBodyLen int,
 	requestSource string,
 	partyPlan *runtimePartyDungeonMovePlan,
-) error {
+) (resultErr error) {
 	runtime := session.dungeon.runtime
 	if runtime == nil || runtime.Session == nil || runtime.Room == nil {
 		s.logGameEvent(session, "game-dungeon-move-blocked",
@@ -1870,6 +1911,12 @@ func (s *Service) handleDungeonMoveRequestLocked(
 			"next_y", request.NextY,
 			"reason", "dungeon_runtime_missing")
 		return nil
+	}
+	diagnostic := s.beginEkernDiagnosticLocked(runtime, "move", requestBodyLen)
+	diagnosticReason := "move_dispatch"
+	if diagnostic != nil {
+		diagnostic.fields = append(diagnostic.fields, "next_x", request.NextX, "next_y", request.NextY)
+		defer func() { s.finishEkernDiagnosticLocked(runtime, diagnostic, diagnosticReason, resultErr) }()
 	}
 	if err := s.persistCurrentDungeonRoomClearQuestLocked(session, runtime); err != nil {
 		return err
@@ -1879,6 +1926,10 @@ func (s *Service) handleDungeonMoveRequestLocked(
 	}
 	plan, err := s.planCurrentDungeonMove(runtime, request)
 	if err != nil {
+		diagnosticReason = "move_preflight_rejected"
+		if diagnostic != nil {
+			diagnostic.fields = append(diagnostic.fields, "current_room_not_cleared", errors.Is(err, worldmap.ErrRunCurrentRoomNotCleared))
+		}
 		currentScene, hasCurrentScene := runtime.Session.Scene()
 		source := plan.Source.Coordinate.String()
 		if hasCurrentScene {
@@ -2089,6 +2140,7 @@ func (s *Service) handleDungeonMoveRequestLocked(
 	}
 	runtime.Room = plan.TargetRoom
 	runtime.loadingRoomVisit++
+	session.dungeonPlacementEpoch.Add(1)
 	// The native NPC and quote belong to this visit to the hell room. Leaving
 	// ends the opportunity; a cached revisit cannot reopen a completed offer.
 	if runtime.epicShop != nil && !currentHellPartySceneIsHellRoom(runtime, committedScene) {
@@ -2173,6 +2225,7 @@ func (s *Service) handleDungeonMoveRequestLocked(
 	// this committed transition too, before either member can finish loading;
 	// otherwise both retain the entry room and suppress every later resend.
 	s.recordDungeonPartyRunKey(session, runtime, committedScene)
+	diagnosticReason = "move_committed"
 	s.logGameEvent(session, "game-dungeon-move-committed",
 		"dungeon_id", runtime.Dungeon.ID,
 		"maze_index", runtime.MazeIndex,

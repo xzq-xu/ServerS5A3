@@ -18,6 +18,7 @@ import (
 	"longheng.io/server/internal/modules/dnf/premium"
 	"longheng.io/server/internal/modules/dnf/progression"
 	dnfrepo "longheng.io/server/internal/modules/dnf/repository"
+	"longheng.io/server/internal/modules/dnf/wedding"
 )
 
 var (
@@ -29,7 +30,7 @@ var (
 const (
 	// Type 29 / item 193 are auction-discount tickets, not Black Diamond.
 	currentDungeonBlackDiamondPremiumType int64 = premium.TypeBlackDiamond
-	currentDungeonBlackDiamondBonusRate         = 0.10
+	currentDungeonBlackDiamondBonusRate         = 0.05
 )
 
 type currentDungeonSettlementRewardResources struct {
@@ -39,6 +40,7 @@ type currentDungeonSettlementRewardResources struct {
 }
 
 type currentDungeonSettlementCommitResult struct {
+	GuildDungeon      guild.DungeonClearResult
 	GuildDungeonItems []dnfdungeon.GuildDungeonGrantedItem
 	DespairItems      []dnfdungeon.DespairGrantedItem
 	GriefItems        []dnfdungeon.GriefGrantedItem
@@ -299,6 +301,12 @@ func (s *Service) produceCurrentDungeonSettlementPlanWithResourcesLocked(
 		}
 	}
 	plan.GuildDungeonItemSlots = guildDungeonRefreshSlots(result.GuildDungeonItems)
+	if result.GuildDungeon.RepeatReward.Enabled {
+		plan.GuildDungeonRepeatRewardBody, err = buildCurrentGuildDungeonRepeatRewardBody(result.GuildDungeon.RepeatReward.Display)
+		if err != nil {
+			return err
+		}
+	}
 	if currentDungeonIsDespairTower(runtime) {
 		floor, err := currentDespairFloor(runtime.Dungeon)
 		if err != nil {
@@ -542,7 +550,7 @@ func currentDungeonScoreBonusExp(base uint32, resources currentDungeonSettlement
 	return uint32(bonus)
 }
 
-// currentBlackDiamondBonusExp returns +10% clear experience when the account
+// currentBlackDiamondBonusExp returns +5% clear experience when the account
 // has an active Black Diamond entitlement. Auction coupons do not qualify.
 func (s *Service) currentBlackDiamondBonusExp(ctx context.Context, accountID string, base uint32) uint32 {
 	if s == nil || base == 0 || strings.TrimSpace(accountID) == "" {
@@ -635,6 +643,9 @@ func (s *Service) commitCurrentDungeonSettlementWithPotion(
 		if err != nil {
 			return currentDungeonSettlementCommitResult{}, err
 		}
+		// The first legitimate clear can activate the season. Its transaction
+		// timestamp must not precede the newly persisted CreatedAt.
+		now = s.gameplayNow()
 		if season.Week(s.gameplayNow()) >= 0 {
 			catalog, err := s.currentWeeklyCatalog(ctx)
 			if err != nil {
@@ -721,7 +732,30 @@ func (s *Service) commitCurrentDungeonSettlementWithPotion(
 		started = finished
 	}
 	fatigueSpent := runtime.fatigueSpent
+	var capsule *wedding.CapsuleRules
+	if s.options.currentClientVersion == "official-24.9" && currentDungeonIsRecommendedClear(runtime) {
+		c, found, e := repositories.Character.Load(ctx, fmt.Sprint(session.selectedCharacterID))
+		if e != nil {
+			return currentDungeonSettlementCommitResult{}, e
+		}
+		if !found || c.AccountID != s.accountIDForSession(session) {
+			return currentDungeonSettlementCommitResult{}, wedding.ErrOwnership
+		}
+		state, e := wedding.Read(c)
+		if e != nil {
+			return currentDungeonSettlementCommitResult{}, e
+		}
+		if state.Phase == wedding.Married {
+			rules, e := s.currentWeddingExtensionRules()
+			if e != nil {
+				return currentDungeonSettlementCommitResult{}, e
+			}
+			value := rules.Capsule
+			capsule = &value
+		}
+	}
 	result, err := owner.CommitSettlement(ctx, dnfdungeon.SettlementCommand{
+		WeddingCapsule:         capsule,
 		BattlePassDungeonKind:  currentBattlePassAdaptedDungeonKind(runtime),
 		BattlePassNoCoinClear:  currentBattlePassDungeonClear(runtime) && !runtime.battlePassCoinUsed,
 		BattlePassSRankClear:   currentBattlePassDungeonClear(runtime) && runtime.battlePassSRankClear,
@@ -757,6 +791,11 @@ func (s *Service) commitCurrentDungeonSettlementWithPotion(
 		return currentDungeonSettlementCommitResult{}, err
 	}
 	runtime.settlementLuckyStar = result.LuckyStar
+	if capsule != nil {
+		if err := s.sendCurrentWeddingCapsuleGauge(session, result.Character); err != nil {
+			s.logGameEvent(session, "game-wedding-capsule-gauge-projection-deferred", "error", err)
+		}
+	}
 	if contribution != nil {
 		if err := s.projectCurrentGuildContribution(session, result.GuildContribution); err != nil {
 			s.logGameEvent(session, "game-guild-contribution-clear-projection-deferred", "error", err)
@@ -783,6 +822,7 @@ func (s *Service) commitCurrentDungeonSettlementWithPotion(
 		}
 	}
 	return currentDungeonSettlementCommitResult{
+		GuildDungeon:      result.GuildDungeon,
 		GuildDungeonItems: result.GuildDungeonItems,
 		DespairItems:      result.DespairItems,
 		GriefItems:        result.GriefItems,

@@ -132,7 +132,11 @@ type Definition struct {
 	DependGiveItemData []int64
 	SubReward          []int64
 	HasDependGiveItem  bool
-	CantGiveUp         bool
+	// emptyDependGiveItem is parser evidence for one genuinely token-free
+	// section. An empty Ints result alone can also hide non-integer data.
+	emptyDependGiveItem bool
+	CantGiveUp          bool
+	DisableQuestClear   bool
 	// HasLevel records an explicit [level] with one or two integer tokens.
 	// Legacy LevelMin/LevelMax defaults remain unchanged; percentage rewards
 	// require this evidence as well as a valid range.
@@ -170,8 +174,9 @@ type Definition struct {
 }
 
 type Catalog struct {
-	ordered []Definition
-	byID    map[int64]Definition
+	monsterMaterialIndex map[int64][]monsterMaterialScope
+	ordered              []Definition
+	byID                 map[int64]Definition
 }
 
 type Snapshot struct {
@@ -181,6 +186,7 @@ type Snapshot struct {
 }
 
 type CharacterEligibility struct {
+	weddingPartner             string
 	Level                      int
 	Job                        int
 	GrowType                   int
@@ -271,6 +277,7 @@ func Load(ctx context.Context, index *dnfpvf.Index) (*Catalog, error) {
 	if len(catalog.ordered) == 0 {
 		return nil, ErrCatalogEmpty
 	}
+	catalog.buildMonsterMaterialIndex()
 	return catalog, nil
 }
 
@@ -540,10 +547,10 @@ func (c *Catalog) DecideAcceptAt(character CharacterEligibility, record dnfrepo.
 // client-list builder can evaluate the quest and its ancestors from definitions
 // it already holds. It is the only place the accept predicate is implemented.
 func (c *Catalog) decideAcceptForDefinition(definition Definition, character CharacterEligibility, record dnfrepo.QuestRecord, completed, active map[int64]struct{}) (AcceptDecision, error) {
-	// Owner.ApplyAccept refuses PVF depend-give-item quests before anything
-	// else: they need an asset transaction this owner does not provide, so the
-	// outcome is a refusal even when the row is already active.
-	if definition.HasDependGiveItem {
+	// Acceptance-item grants require an asset transaction this owner does not
+	// provide. Only the verified empty wedding section has no grant to make;
+	// all other such definitions are refused even when already active.
+	if definition.HasDependGiveItem && !weddingEmptyAcceptanceItems(definition) {
 		return AcceptRejected, ErrQuestAcceptEventItemsRequired
 	}
 	if existing, known := questStateFor(record, definition.ID); known && isActiveQuestStatus(existing.Status) {
@@ -834,11 +841,19 @@ func parseDefinition(entry dnfpvf.ListEntry, doc *dnfpvf.Document) Definition {
 	definition.CheckCount = append([]int64(nil), doc.Ints("check count")...)
 	definition.ConditionData = append([]int64(nil), doc.Ints("condition data")...)
 	definition.SubReward = append([]int64(nil), doc.Ints("sub reward")...)
-	if _, ok := doc.Section("depend give item"); ok {
+	if tokens, ok := doc.Section("depend give item"); ok {
 		definition.HasDependGiveItem = true
 		definition.DependGiveItemData = append([]int64(nil), doc.Ints("depend give item")...)
+		sections := 0
+		for _, section := range doc.Sections {
+			if normalizeQuestTag(section.Name) == "depend give item" {
+				sections++
+			}
+		}
+		definition.emptyDependGiveItem = len(tokens) == 0 && sections == 1
 	}
 	_, definition.CantGiveUp = doc.Section("cant giveup")
+	_, definition.DisableQuestClear = doc.Section("disable quest clear")
 	definition.Job = strings.Join(doc.Texts("job"), " ")
 	definition.TargetCharacter = strings.Join(doc.Texts("target character"), " ")
 	if tokens, ok := doc.Section("target character"); ok {
@@ -1065,6 +1080,9 @@ func definitionInitialTrigger(definition Definition, completed map[int64]struct{
 	case "quest clear", "clear quest":
 		return questClearInitialTrigger(definition.IntData, completed)
 	case "condition under clear":
+		if weddingClearDefinition(definition) {
+			return boundedTriggerChannel(definition.IntData[2])
+		}
 		// The live PVF's subtype 6 uses (dungeon, minimum difficulty,
 		// required clears), e.g. 5478 needs three and 8512 needs six.
 		// A four-integer stride silently initialized every such task to one.
@@ -1238,7 +1256,8 @@ func (c *Catalog) definitionAcceptable(definition Definition, character Characte
 	if grade == "auto daily mission" && !c.IsWorldMapHuntQuest(definition.ID) {
 		return false
 	}
-	if !(selectableGrade(grade) || allowedEpicRoad && grade == "special") || grade == "training" {
+	allowedWedding := weddingPreparationDefinition(definition) && character.weddingPartner != ""
+	if !(selectableGrade(grade) || allowedEpicRoad && grade == "special" || allowedWedding) || grade == "training" {
 		return false
 	}
 	if character.Level < definition.LevelMin || character.Level > definition.LevelMax {

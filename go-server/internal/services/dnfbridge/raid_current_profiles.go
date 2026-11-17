@@ -23,22 +23,59 @@ func newCurrentRaidProfileBatch(s *Service, ctx context.Context) *currentCrossSc
 }
 
 func (s *Service) sendCurrentRuntimeRaidProfilesWithBatch(session *gameSession, state runtimeRaidState, batch *currentCrossSceneProfileBatch) error {
-	if !s.currentRaidInfoVisible(session, state) {
+	return s.sendCurrentRuntimeRaidProfilesWithBatchForActors(session, state, batch, nil)
+}
+
+func (s *Service) sendCurrentRuntimeRaidProfilesWithBatchForActors(session *gameSession, state runtimeRaidState, batch *currentCrossSceneProfileBatch, actors map[uint16]bool) error {
+	peer, err := batch.peer(session)
+	if err != nil {
+		return raidProfilePreparationError(err)
+	}
+	visible := func() bool {
+		return peer != nil && peer.current(s) && session.loginPacketSeen && session.accountFromToken &&
+			peer.account == s.accountIDForSession(session) && s.currentRaidInfoContextVisible(session, state)
+	}
+	if !visible() {
 		return nil
 	}
-	repos, available := s.repositoryGroup()
-	if !available || repos.Character == nil {
+	if !s.currentRaidInfoContextVisible(session, state) {
 		return nil
+	}
+	body, err := s.currentRuntimeRaidProfileBody(state, batch)
+	if err != nil {
+		return raidProfilePreparationError(err)
+	}
+	if len(body) == 0 || !visible() {
+		return nil
+	}
+	s.logGameEvent(session, "game-current-raid-profiles-sent", "raid_key", state.RaidKey, "profile_count", (len(body)-4)/57, "member_count", len(state.Members))
+	if err := s.sendGameUpperRawClassCodec(session, raid.CurrentRaidProfilesMsgID, body, 0, true); err != nil {
+		return err
+	}
+	s.sendCurrentRaidCrossSceneProfilesForActors(batch, session, state, actors)
+	return nil
+}
+
+func (s *Service) currentRuntimeRaidProfileBody(state runtimeRaidState, batch *currentCrossSceneProfileBatch) ([]byte, error) {
+	if body, found := batch.raidProfiles[state.RaidKey]; found {
+		return body, nil
+	}
+	repos, available := s.repositoryGroupFor(batch.ctx)
+	if !available || repos.Character == nil {
+		return nil, nil
 	}
 	rows := make([]raid.CurrentProfileRecord, 0, len(state.Members))
-	ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
+	ctx, cancel := context.WithTimeout(batch.ctx, createWriteTimeout)
 	defer cancel()
 	for _, member := range state.Members {
 		if member.CharID == 0 {
 			continue
 		}
 		character, found, err := repos.Character.Load(ctx, strconv.Itoa(int(member.CharID)))
-		if err != nil || !found || character.CharacterID != strconv.Itoa(int(member.CharID)) || character.Level <= 0 || character.Level > 65535 {
+		if err != nil {
+			return nil, err
+		}
+		if !found || character.CharacterID != strconv.Itoa(int(member.CharID)) || character.Level <= 0 || character.Level > 65535 {
 			continue
 		}
 		job, err := strconv.ParseUint(character.Job, 10, 8)
@@ -52,17 +89,19 @@ func (s *Service) sendCurrentRuntimeRaidProfilesWithBatch(session *gameSession, 
 		}
 		rows = append(rows, row)
 	}
-	if len(rows) == 0 || !s.currentRaidInfoVisible(session, state) {
-		return nil
+	if len(rows) == 0 {
+		return nil, nil
 	}
 	body, err := raid.BuildCurrentRaidProfilesBody(rows)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	s.logGameEvent(session, "game-current-raid-profiles-sent", "raid_key", state.RaidKey, "profile_count", len(rows), "member_count", len(state.Members))
-	if err := s.sendGameUpperRawClassCodec(session, raid.CurrentRaidProfilesMsgID, body, 0, true); err != nil {
-		return err
+	// Partial reads remain retryable for the next receiver/broadcast.
+	if len(rows) == len(state.Members) {
+		if batch.raidProfiles == nil {
+			batch.raidProfiles = make(map[uint32][]byte)
+		}
+		batch.raidProfiles[state.RaidKey] = body
 	}
-	s.sendCurrentRaidCrossSceneProfiles(batch, session, state)
-	return nil
+	return body, nil
 }

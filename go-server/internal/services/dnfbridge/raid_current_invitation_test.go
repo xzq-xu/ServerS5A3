@@ -27,6 +27,84 @@ func currentRaidInviteFixture(target uint16) []byte {
 	binary.LittleEndian.PutUint16(b[7:], 0x2345)
 	return b
 }
+
+func TestOfficial249LoginSuccessLeavesRaidInviteWindowGateClear(t *testing.T) {
+	s, a, _, _, _, _ := prepareCurrentRaidInvitationTest(t)
+	s.options.currentClientVersion = "official-24.9"
+	s.options.serverIP = "10.254.90.2"
+	s.options.gameOuterToken = 0x11223344
+
+	body := s.buildLoginSuccess(a.channel)
+	if len(body) != 40 {
+		t.Fatalf("official-24.9 login body len=%d, want 4 header + token + 2 u32 + 24 state = 40: %x", len(body), body)
+	}
+	if !bytes.Equal(body[:4], []byte{1, 1, a.channel.Type, 1}) {
+		t.Fatalf("official-24.9 login prefix=%x, want 01 01 type 01", body[:4])
+	}
+	if got := binary.LittleEndian.Uint32(body[4:8]); got != s.options.gameOuterToken {
+		t.Fatalf("official-24.9 login token=%#x, want %#x", got, s.options.gameOuterToken)
+	}
+	if got := binary.LittleEndian.Uint32(body[8:12]); got != uint32(a.channel.Port) {
+		t.Fatalf("official-24.9 login port=%d, want %d", got, a.channel.Port)
+	}
+	if got := binary.LittleEndian.Uint32(body[12:16]); got != 0 {
+		t.Fatalf("official-24.9 login reserved=%#x, want 0", got)
+	}
+	tail := body[16:]
+	if tail[2] != 1 || tail[3] != 1 {
+		t.Fatalf("official-24.9 security-card state=%d/%d, want retained 1/1", tail[2], tail[3])
+	}
+	// Native 927634 reads these bytes into 0x56A3811/0x56A3810. The latter
+	// gates mode-10 window creation and otherwise leaves only the prompt sound.
+	if tail[5] != 0 || tail[6] != 0 {
+		t.Fatalf("official-24.9 native invitation gates=%d/%d, want 0/0", tail[5], tail[6])
+	}
+}
+
+func TestRaidTownInviteMode10KeepsOrdinaryMode0InviteIntact(t *testing.T) {
+	s, a, b, ac, bc, _ := prepareCurrentRaidInvitationTest(t)
+	s.options.currentClientVersion = "official-24.9"
+
+	if err := s.handleGameCommand(a, 1, 10, currentRaidInviteFixture(b.selectedCharacterID)); err != nil {
+		t.Fatal(err)
+	}
+	ack, rest := splitGameServerUpperPacket(t, ac.write.Bytes())
+	if ack.Header.MsgID != 10 || ack.Header.Classification != 1 || !bytes.Equal(ack.Body, []byte{1}) || len(rest) != 0 {
+		t.Fatalf("raid invite leader ACK=%+v/%x tail=%x", ack.Header, ack.Body, rest)
+	}
+	raidNotice, rest := splitGameServerUpperPacket(t, bc.write.Bytes())
+	if raidNotice.Header.MsgID != 7 || raidNotice.Header.Classification != 0 || len(raidNotice.Body) != 13 || raidNotice.Body[2] != 10 || len(rest) != 0 {
+		t.Fatalf("raid invite notice=%+v/%x tail=%x, want class0/op7 mode10", raidNotice.Header, raidNotice.Body, rest)
+	}
+
+	ac.write.Reset()
+	bc.write.Reset()
+	ordinary := make([]byte, 13)
+	binary.LittleEndian.PutUint16(ordinary, b.selectedCharacterID)
+	binary.LittleEndian.PutUint32(ordinary[3:], 0x55667788)
+	binary.LittleEndian.PutUint16(ordinary[7:], 0x99aa)
+	if err := s.handleGameCommand(a, 1, 10, ordinary); err != nil {
+		t.Fatal(err)
+	}
+	ack, rest = splitGameServerUpperPacket(t, ac.write.Bytes())
+	if ack.Header.MsgID != 10 || ack.Header.Classification != 1 || !bytes.Equal(ack.Body, party.BuildRequestPeerAck()) || len(rest) != 0 {
+		t.Fatalf("ordinary invite leader ACK=%+v/%x tail=%x", ack.Header, ack.Body, rest)
+	}
+	ordinaryNotice, rest := splitGameServerUpperPacket(t, bc.write.Bytes())
+	want := party.BuildRequestPeerNotice(a.selectedCharacterID, party.RequestPeerRequest{
+		TargetID: b.selectedCharacterID,
+		Mode:     0,
+		Value0:   0x55667788,
+		Value1:   0x99aa,
+	})
+	if ordinaryNotice.Header.MsgID != 7 || ordinaryNotice.Header.Classification != 0 || !bytes.Equal(ordinaryNotice.Body, want) || len(rest) != 0 {
+		t.Fatalf("ordinary invite notice=%+v/%x tail=%x, want %x", ordinaryNotice.Header, ordinaryNotice.Body, rest, want)
+	}
+	if bytes.Equal(ordinaryNotice.Body, raidNotice.Body) {
+		t.Fatal("ordinary mode0 invite was replaced by raid mode10 bytes")
+	}
+}
+
 func TestCurrentRaidPeerCheckActualDispatch(t *testing.T) {
 	s, a, b, ac, bc, _ := prepareCurrentRaidInvitationTest(t)
 	body := []byte{23, 0, 0, byte(s.channelAdvertiseID())}
@@ -77,7 +155,7 @@ func TestCurrentRaidInvitationActualDispatch(t *testing.T) {
 	roster, rest := splitGameServerUpperPacket(t, rest)
 	leaderRest := consumeCurrentRaidProfiles(t, ac.write.Bytes(), after)
 	leaderRoster, leaderRest := splitGameServerUpperPacket(t, leaderRest)
-	wantMetadata, _ := buildCurrentRuntimeRaidMetadata(after, 2)
+	wantMetadata, _ := buildCurrentRuntimeRaidMetadata(raidAllSoloWireFixture(after), 2)
 	wantRoster, _ := s.buildRuntimeRaidRosterBody(after)
 	if ack.Header.MsgID != 11 || ack.Header.Classification != 1 || !bytes.Equal(ack.Body, wantAck) || metadata.Header.MsgID != 591 || !bytes.Equal(metadata.Body, wantMetadata) || !bytes.Equal(roster.Body, wantRoster) || !bytes.Equal(leaderRoster.Body, wantRoster) || len(rest) != 0 || len(leaderRest) != 0 || len(s.currentRaidInvitations) != 0 || len(s.currentRaidApplications) != 0 {
 		t.Fatal("acceptance did not emit exact committed metadata/rosters")
@@ -105,7 +183,7 @@ func assertCurrentRaidFailureOnly(t *testing.T, c *bufferConn, op uint16) {
 	}
 }
 func TestCurrentRaidPeerCheckRejectsUnverifiedTargets(t *testing.T) {
-	for _, kind := range []string{"short", "trailing", "foreign_server", "foreign_channel", "own_target", "offline", "target_owner", "source_owner", "source_unbound", "target_unbound", "target_raid", "channel", "scene", "presence_session", "ordinary"} {
+	for _, kind := range []string{"short", "trailing", "foreign_server", "foreign_channel", "own_target", "offline", "target_owner", "source_owner", "source_unbound", "target_unbound", "foreign_raid", "channel", "scene", "presence_session", "ordinary"} {
 		t.Run(kind, func(t *testing.T) {
 			s, a, b, ac, bc, state := prepareCurrentRaidInvitationTest(t)
 			body := []byte{23, 0, 0, byte(s.channelAdvertiseID())}
@@ -131,8 +209,9 @@ func TestCurrentRaidPeerCheckRejectsUnverifiedTargets(t *testing.T) {
 				s.unbindGameSession(a)
 			case "target_unbound":
 				s.unbindGameSession(b)
-			case "target_raid":
+			case "foreign_raid":
 				s.raids[state.RaidKey].Members = append(s.raids[state.RaidKey].Members, runtimeRaidMemberState{CharID: b.selectedCharacterID})
+				s.raids[state.RaidKey].RaidKey ^= 1 << 24
 			case "channel":
 				b.channel.ID = 24
 			case "scene":
@@ -374,7 +453,7 @@ func TestCurrentRaidInvitationLastSlotConcurrentAcceptance(t *testing.T) {
 		if p.Body[0] == 1 {
 			successes++
 			metadata, tail := splitGameServerUpperPacket(t, rest)
-			want, _ := buildCurrentRuntimeRaidMetadata(after, 2)
+			want, _ := buildCurrentRuntimeRaidMetadata(raidAllSoloWireFixture(after), 2)
 			if metadata.Header.MsgID != 591 || !bytes.Equal(metadata.Body, want) {
 				t.Fatal("winner metadata wrong")
 			}

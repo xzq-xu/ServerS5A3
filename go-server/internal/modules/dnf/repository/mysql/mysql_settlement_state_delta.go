@@ -45,7 +45,7 @@ func characterStatSnapshotEligible(stats map[string]int64) bool {
 
 func saveChangedCharacterStats(ctx context.Context, database SQLDB, table, id string, before, after map[string]int64) error {
 	for _, key := range sortedStringKeys(before) {
-		if isMySQLCharacterMirrorStatKey(key) || permanentCharacterStat(key) {
+		if isMySQLCharacterMirrorStatKey(key) || permanentCharacterStat(key) || repository.IsCharacterWeddingStat(key) {
 			continue
 		}
 		if _, exists := after[key]; !exists {
@@ -54,24 +54,15 @@ func saveChangedCharacterStats(ctx context.Context, database SQLDB, table, id st
 			}
 		}
 	}
+	var changed []string
 	for _, key := range sortedStringKeys(after) {
-		if isMySQLCharacterMirrorStatKey(key) {
+		if isMySQLCharacterMirrorStatKey(key) || repository.IsCharacterWeddingStat(key) {
 			continue
 		}
 		if value, exists := before[key]; exists && value == after[key] {
 			continue
 		}
-		query := "INSERT INTO " + table + " (character_id, stat_key, stat_value) VALUES (?, ?, ?)"
-		if _, event := repository.LevelUpEventLevel(key); event {
-			query += " ON DUPLICATE KEY UPDATE stat_value = IF(stat_value = 0, VALUES(stat_value), IF(stat_value < 0 OR VALUES(stat_value) >= 0, stat_value, VALUES(stat_value)))"
-		} else if strings.HasPrefix(key, repository.LevelUpRewardStatPrefix) {
-			query += " ON DUPLICATE KEY UPDATE stat_value = IF(stat_value = 0, VALUES(stat_value), stat_value)"
-		} else {
-			query += " ON DUPLICATE KEY UPDATE stat_value = VALUES(stat_value)"
-		}
-		if _, err := database.ExecContext(ctx, query, id, key, after[key]); err != nil {
-			return err
-		}
+		changed = append(changed, key)
 	}
-	return nil
+	return writeCharacterStatRows(ctx, database, table, id, changed, after, true)
 }

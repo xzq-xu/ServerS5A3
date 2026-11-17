@@ -18,6 +18,9 @@ type currentCrossSceneProfileBatch struct {
 	peers   map[uint16]*currentCrossSceneProfilePeer
 	bodies  map[currentCrossSceneProfileKey]currentCrossSceneProfileBody
 	sent    map[currentCrossSceneProfileDelivery]bool
+	// One raid broadcast owns one immutable roster snapshot. Reuse its compact
+	// repository-derived rows across receivers, just like its typed actor bodies.
+	raidProfiles map[uint32][]byte
 	// Raid rosters share a preparation budget across recipients. Once a frame
 	// is admitted, give its write a full bounded window instead of truncating
 	// the stream when the remaining preparation time runs out.
@@ -163,7 +166,7 @@ func (b *currentCrossSceneProfileBatch) send(viewer, actor *gameSession, owner b
 		}
 		b.bodies[key] = body
 	}
-	delivered, err := s.sendCurrentCrossSceneProfileFramesWithBudget(b.ctx, viewer, actor, [][]byte{body.data}, func() bool {
+	delivered, err := s.sendCurrentCrossSceneProfileRefreshFrame(b.ctx, viewer, actor, body.data, func() bool {
 		return body.revision == actor.crossSceneAppearanceRevision &&
 			v.current(s) && a.current(s) && b.route == s.currentSceneActorRoute() &&
 			owner == currentConnectionTownActorOwnerContext(viewer) &&

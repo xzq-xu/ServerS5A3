@@ -73,6 +73,14 @@ func GoldConsignTierAmount(itemID int64) (int64, bool) {
 	return 0, false
 }
 
+func GoldConsignMinimumPrice(itemID int64) (int64, bool) {
+	amount, ok := GoldConsignTierAmount(itemID)
+	if !ok {
+		return 0, false
+	}
+	return amount / 1000, true
+}
+
 func IsGoldConsignTier(itemID int64) bool {
 	_, ok := GoldConsignTierAmount(itemID)
 	return ok
@@ -88,8 +96,6 @@ func ResolveGoldConsignFee(price, average int64, hasAuctionCoupon bool) (feePerc
 	// Compare with integer maths throughout: price*100 against average*threshold
 	// avoids both floating point and an overflow on the 2亿 tier.
 	switch {
-	case price*100 < average*40:
-		return 0, false
 	case price*100 <= average*150:
 		return goldConsignBaseFee(hasAuctionCoupon), true
 	case price*100 <= average*160:
@@ -152,6 +158,8 @@ type GoldConsignResult struct {
 	Listing              GoldConsignListing
 	GoldAfter, CeraAfter int64
 	Repeated             bool
+	WalletAfter          shop.Wallet
+	Payment              shop.WalletPayment
 }
 type GoldConsignOwner struct {
 	owner        *Owner
@@ -263,13 +271,32 @@ func (o *GoldConsignOwner) AverageCeraPrice(ctx context.Context, itemID int64) (
 	if !IsGoldConsignTier(itemID) {
 		return 0, 0, ErrGoldConsignNotTier
 	}
-	inv, found, e := o.repositories.Inventory.Load(ctx, EscrowCharacterID)
+	slots, found, e := o.loadReadSlots(ctx, goldConsignSoldPrefix, itemID)
 	if e != nil || !found {
 		return 0, 0, e
 	}
-	avg, n := goldConsignAverage(inv.Slots, itemID)
+	avg, n := goldConsignAverage(slots, itemID)
 	return avg, n, nil
 }
+
+// Read projections do not load unrelated auction, payout or warehouse data.
+// Asset-changing operations continue to use their authoritative transaction bag.
+func (o *GoldConsignOwner) loadReadSlots(ctx context.Context, prefix string, itemID int64) (map[string]dnfrepo.ItemStack, bool, error) {
+	inventory := o.repositories.Inventory
+	if itemID > 0 {
+		if reader, ok := inventory.(dnfrepo.InventorySlotItemPrefixReader); ok {
+			slots, err := reader.LoadInventorySlotItemPrefix(ctx, EscrowCharacterID, prefix, itemID)
+			return slots, true, err
+		}
+	}
+	if reader, ok := inventory.(dnfrepo.InventorySlotPrefixReader); ok {
+		slots, err := reader.LoadInventorySlotPrefix(ctx, EscrowCharacterID, prefix)
+		return slots, true, err
+	}
+	bag, found, err := inventory.Load(ctx, EscrowCharacterID)
+	return bag.Slots, found, err
+}
+
 func (o *GoldConsignOwner) Register(ctx context.Context, q GoldConsignRegisterCommand) (GoldConsignResult, error) {
 	amount, ok := GoldConsignTierAmount(q.GoldItemID)
 	if !ok {
@@ -277,6 +304,10 @@ func (o *GoldConsignOwner) Register(ctx context.Context, q GoldConsignRegisterCo
 	}
 	if q.ListingID == 0 || q.SellerID == "" || q.SellerID == EscrowCharacterID || q.AccountID == "" || q.PriceCera <= 0 || q.PriceCera > math.MaxInt32 || (q.DurationHour != 24 && q.DurationHour != 48) {
 		return GoldConsignResult{}, ErrInvalidRequest
+	}
+	minimumPrice, _ := GoldConsignMinimumPrice(q.GoldItemID)
+	if q.PriceCera < minimumPrice {
+		return GoldConsignResult{}, ErrGoldConsignPriceRejected
 	}
 	if e := o.EnsureEscrow(ctx); e != nil {
 		return GoldConsignResult{}, e
@@ -361,13 +392,17 @@ func (o *GoldConsignOwner) Register(ctx context.Context, q GoldConsignRegisterCo
 	return result, nil
 }
 func (o *GoldConsignOwner) Search(ctx context.Context, ids []int64) ([]GoldConsignListing, error) {
-	inv, found, e := o.repositories.Inventory.Load(ctx, EscrowCharacterID)
+	var itemID int64
+	if len(ids) == 1 {
+		itemID = ids[0]
+	}
+	slots, found, e := o.loadReadSlots(ctx, goldConsignListingPrefix, itemID)
 	if e != nil || !found {
 		return nil, e
 	}
 	out := []GoldConsignListing{}
 	now := o.clock()
-	for key, s := range inv.Slots {
+	for key, s := range slots {
 		if !strings.HasPrefix(key, goldConsignListingPrefix) {
 			continue
 		}
@@ -460,15 +495,17 @@ func (o *GoldConsignOwner) Buy(ctx context.Context, q GoldConsignBuyCommand) (Go
 		if !found {
 			return ErrNotOwner
 		}
-		balance := shop.Balance(account)
-		if balance < l.PriceCera {
-			return shop.ErrCeraInsufficient
+		// Private server policy matches the cash shop: happy tokens, regular
+		// tokens, then Cera. Plan and debit remain in the existing sale transaction.
+		payment, e := shop.PlanWalletPayment(shop.WalletBalance(account), l.PriceCera, shop.PayPolicyWaterfall)
+		if e != nil {
+			return errors.Join(shop.ErrCeraInsufficient, e)
 		}
 		if escrow.Stats["gold"] < l.GoldAmount {
 			return ErrGoldUnavailable
 		}
 		now := o.clock()
-		shop.SetBalance(&account, balance-l.PriceCera)
+		walletAfter := shop.ApplyWalletPayment(&account, payment)
 		account.UpdatedAt = now
 		escrow.Stats["gold"] -= l.GoldAmount
 		escrow.UpdatedAt = now
@@ -491,7 +528,7 @@ func (o *GoldConsignOwner) Buy(ctx context.Context, q GoldConsignBuyCommand) (Go
 		if e = i.Save(ctx, inv); e != nil {
 			return e
 		}
-		result = GoldConsignResult{Listing: l, CeraAfter: balance - l.PriceCera}
+		result = GoldConsignResult{Listing: l, CeraAfter: walletAfter.Cera, WalletAfter: walletAfter, Payment: payment}
 		return nil
 	})
 	if err != nil {

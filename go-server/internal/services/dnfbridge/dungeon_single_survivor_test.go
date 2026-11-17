@@ -9,11 +9,16 @@ import (
 func assertDungeonSurvivorRetainsParty(t *testing.T, survivor *gameSession, departing uint16) {
 	t.Helper()
 	local, departure, restored, removed, hp := -1, -1, -1, -1, -1
+	reset := false
 	for i, frame := range splitUpperFrames(t, survivor.conn.(*bufferConn).write.Bytes()) {
 		switch frame.msgID {
 		case 2, 11:
 			t.Fatal("survivor actor or network was rebuilt")
 		case 9:
+			if len(frame.body) == 10 && frame.body[9] == 3 && local < 0 {
+				reset = true
+				continue
+			}
 			if len(frame.body) < 10 || frame.body[9] == 3 {
 				t.Fatal("surviving party received disband record")
 			}
@@ -29,7 +34,8 @@ func assertDungeonSurvivorRetainsParty(t *testing.T, survivor *gameSession, depa
 				}
 				restored = i
 			case 2:
-				if id != departing || len(frame.body) != 15 || frame.body[10] != 0 {
+				rows := retainedDepartureRows(t, frame.body, currentClientSelectedChannelID(survivor))
+				if id != departing || len(rows) != 1 || rows[0].uid != survivor.selectedCharacterID {
 					t.Fatal("wrong departing record")
 				}
 				departure = i
@@ -40,13 +46,16 @@ func assertDungeonSurvivorRetainsParty(t *testing.T, survivor *gameSession, depa
 			}
 			removed = i
 		case 153:
+			if reset && local < 0 && len(frame.body) == 1 && frame.body[0] == 0 {
+				continue
+			}
 			if len(frame.body) <= 1 || frame.body[0] != 1 {
 				t.Fatal("surviving party realtime roster was cleared")
 			}
 			hp = i
 		}
 	}
-	if local < 0 || departure <= local || restored <= departure || removed <= restored || hp <= removed {
+	if !reset || local < 0 || departure <= local || restored <= departure || removed <= restored || hp <= removed {
 		t.Fatalf("invalid departure order: roster=%d departing=%d restored=%d actor=%d realtime=%d", local, departure, restored, removed, hp)
 	}
 }

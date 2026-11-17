@@ -44,6 +44,12 @@ type CharacterSlotSwapper interface {
 	SwapCharacterSlots(context.Context, string, int, int) error
 }
 
+// CharacterSnapshotSlotSwapper validates the sent identities while holding the
+// same write transaction used to swap their slots. No unchecked fallback.
+type CharacterSnapshotSlotSwapper interface {
+	SwapCharacterSlotsFromSnapshot(context.Context, string, CharacterRecord, CharacterRecord) error
+}
+
 // CharacterDeletedProfessionReader 供决斗专用角色检查删除冷却，缺少能力时拒绝创建。
 type CharacterDeletedProfessionReader interface {
 	LastDeletedProfession(context.Context, string, byte, byte) (CharacterRecord, bool, error)
@@ -150,10 +156,23 @@ const (
 	CharacterFieldStats    CharacterField = "stats"
 	CharacterFieldLocation CharacterField = "location"
 	CharacterFieldRoster   CharacterField = "roster"
+	// Wedding is an explicit authority to replace wedding_v1_* statistics.
+	// Ordinary stats/full saves must preserve that independently transacted state.
+	CharacterFieldWedding CharacterField = "wedding"
 )
 
 // SaveCharacterFields 保存角色指定字段；底层不支持局部保存时退化为整条保存。
 func SaveCharacterFields(ctx context.Context, repo CharacterRepository, record CharacterRecord, fields ...CharacterField) error {
+	// Preserve explicit authority through decorators that only expose Store.Save.
+	for _, field := range fields {
+		if field == CharacterFieldWedding {
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			ctx = context.WithValue(ctx, characterWeddingWriteContextKey{}, CharacterFields.Normalize(fields))
+			break
+		}
+	}
 	return db.SaveFields(ctx, repo, record, CharacterFields.Normalize, fields...)
 }
 

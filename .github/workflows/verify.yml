@@ -2,6 +2,7 @@ name: Verify
 on:
   pull_request:
     branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
 permissions:
   contents: read
@@ -16,9 +17,12 @@ jobs:
       game: ${{ steps.scope.outputs.game }}
       tooling: ${{ steps.scope.outputs.tooling }}
       container: ${{ steps.scope.outputs.container }}
+      ready: ${{ github.event_name == 'workflow_dispatch' || (!github.event.pull_request.draft && !contains(github.event.pull_request.labels.*.name, 'quick-local-ci')) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          # Manual checks need both parents to recognize already merged notes.
+          fetch-depth: 2
           persist-credentials: false
       - name: Select checks and validate change notes
         id: scope
@@ -35,7 +39,7 @@ jobs:
           fi
   linux:
     needs: scope
-    if: needs.scope.outputs.game == 'true'
+    if: needs.scope.outputs.ready == 'true' && needs.scope.outputs.game == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -51,7 +55,7 @@ jobs:
         run: sh build.sh linux amd64 server
   tooling:
     needs: scope
-    if: needs.scope.outputs.tooling == 'true'
+    if: needs.scope.outputs.ready == 'true' && needs.scope.outputs.tooling == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -70,7 +74,7 @@ jobs:
           sh scripts/ci/test_build_components.sh
   container:
     needs: scope
-    if: needs.scope.outputs.container == 'true'
+    if: needs.scope.outputs.ready == 'true' && needs.scope.outputs.container == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -79,7 +83,7 @@ jobs:
           persist-credentials: false
       - run: docker build -t servers5a3-ci -f deploy/docker/Dockerfile .
   required:
-    if: always() && github.repository == 'Cec1c/ServerS5A3'
+    if: always() && github.repository == 'Cec1c/ServerS5A3' && (github.event_name == 'workflow_dispatch' || (!github.event.pull_request.draft && !contains(github.event.pull_request.labels.*.name, 'quick-local-ci')))
     needs: [scope, linux, tooling, container]
     runs-on: ubuntu-latest
     steps:

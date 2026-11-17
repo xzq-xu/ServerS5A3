@@ -65,6 +65,7 @@ type Command struct {
 	DamageFontIndex         uint16
 	Category                byte
 	Condition               byte
+	SortKeys                func(dnfrepo.ItemStack) (alignedcmd.InventorySortKeys, error)
 	NeedsOwner              string
 	// SortLock / SortLockRequested 承接 op713/714 的位置锁意图（DOC-067）：
 	// SortLock 由 opcode 决定（713=锁、714=解锁），不是 toggle。
@@ -81,12 +82,13 @@ type Command struct {
 	UpgradePolicyRequired     bool
 	UpgradePolicyCurrentLevel byte
 	// MaterialItemID/Count are the runtime-PVF upgrade table requirement.
-	UpgradeMaterialItemID  int
-	UpgradeMaterialCount   int
-	UpgradeCostResolver    alignedcmd.UpgradeCostResolver
-	UpgradeNPCPresent      bool
-	UpgradeNPCID           uint16
-	UpgradeNPCMaterialSlot int16
+	UpgradeMaterialItemID        int
+	UpgradeMaterialCount         int
+	UpgradeCostResolver          alignedcmd.UpgradeCostResolver
+	UpgradeEquippedBonusResolver alignedcmd.UpgradeEquippedBonusResolver
+	UpgradeNPCPresent            bool
+	UpgradeNPCID                 uint16
+	UpgradeNPCMaterialSlot       int16
 	// DestroyBonusItemID/Count: compensation item on destruction.
 	UpgradeDestroyBonusItemID int
 	UpgradeDestroyBonusCount  int
@@ -174,6 +176,7 @@ func NewSortCommand(req alignedcmd.Request, parsed SortItemRequest) Command {
 	cmd.SourceListType = parsed.ListType
 	cmd.Category = parsed.Category
 	cmd.Condition = parsed.Condition
+	cmd.SortKeys = req.InventorySortKeys
 	return cmd
 }
 
@@ -268,6 +271,7 @@ func NewUpgradeCommand(req alignedcmd.Request, parsed UpgradeItemRequest) Comman
 	cmd.TargetItemName = parsed.TargetItemName
 	cmd.UpgradeNoticeLevel = -1
 	cmd.UpgradeCostResolver = req.UpgradeCostResolver
+	cmd.UpgradeEquippedBonusResolver = req.UpgradeEquippedBonusResolver
 	cmd.UpgradeNPCPresent = parsed.NPCContextPresent
 	cmd.UpgradeNPCID = parsed.NPCTemplateID
 	cmd.UpgradeNPCMaterialSlot = parsed.NPCMaterialSlotIndex

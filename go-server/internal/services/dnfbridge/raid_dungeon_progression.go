@@ -1,7 +1,6 @@
 package dnfbridge
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -104,6 +103,14 @@ func (s *Service) reduceCurrentRaidDungeonClearLocked(session *gameSession, runt
 		if !currentRaidHasTwoPhaseProgram(b) {
 			return runtimeRaidState{}, false, fmt.Errorf("raid clear progression program unavailable")
 		}
+		energyEventID := ""
+		if b.Mode == 1 && b.Phase == 1 && dungeonID == 218 {
+			var ownerErr error
+			energyEventID, ownerErr = currentAntonLargeTransmissionEvent(runtime)
+			if ownerErr != nil {
+				return runtimeRaidState{}, false, ownerErr
+			}
+		}
 		// Commit elapsed timer effects even when they invalidate this clear.
 		// Discarding Tick on an old-attempt error would preserve a dead phase.
 		priorEpoch := b.Anton.Epoch()
@@ -143,6 +150,13 @@ func (s *Service) reduceCurrentRaidDungeonClearLocked(session *gameSession, runt
 		}
 		if replay {
 			return runtimeRaidState{}, false, fmt.Errorf("raid domain/aggregate clear journal mismatch")
+		}
+		if energyEventID != "" {
+			next, _, err = next.ApplyBarrierDamage(energyEventID, raid.AntonLargeTransmission, dungeonID, e.Attempt, now)
+			if err != nil {
+				b.ProgressVersion++
+				return cloneRuntimeRaidState(*state), true, err
+			}
 		}
 		b.Anton, b.Dungeons, b.PhaseCompleted = next, next.Dungeons(), next.PhaseCleared()
 	}
@@ -201,47 +215,10 @@ func (s *Service) queueCurrentRaidDungeonProgress(state runtimeRaidState) {
 	}
 	s.queueCurrentRaidWeeklyClears()
 	for _, member := range state.Members {
-		peer, found := s.onlineGameSession(member.CharID)
+		identity, found := s.onlineGameSessionCharacterSnapshot(member.CharID)
 		if !found {
 			continue
 		}
-		id, generation := member.CharID, peer.characterGeneration
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), createWriteTimeout)
-			defer cancel()
-			err := s.callGameSession(ctx, peer, "raid-owned-dungeon-progress", func() error {
-				if peer.selectedCharacterID != id || peer.characterGeneration != generation || !s.currentRaidAuthenticated(peer) {
-					return nil
-				}
-				s.raidMu.Lock()
-				live := s.runtimeRaidByMemberLocked(id)
-				valid := live != nil && live.Started && live.RaidKey == state.RaidKey && live.Battle != nil &&
-					live.Battle.InstanceID == state.Battle.InstanceID && live.Battle.Phase == state.Battle.Phase &&
-					live.Battle.ProgressVersion >= state.Battle.ProgressVersion &&
-					live.Battle.MemberAccounts[id] == s.accountIDForSession(peer)
-				var latest runtimeRaidState
-				if valid {
-					latest = cloneRuntimeRaidState(*live)
-				}
-				s.raidMu.Unlock()
-				if !valid {
-					return nil
-				}
-				if latest.Battle.Phase == 1 && !latest.Battle.PhaseCompleted && !latest.Battle.TimedOut {
-					if err := s.sendCurrentRaidBattleState(peer, latest); err != nil {
-						return err
-					}
-				} else if err := s.sendCurrentRaidProgressProjection(peer, latest, false, false); err != nil {
-					return err
-				}
-				if err := s.sendCurrentAntonTerminalResult(peer, latest); err != nil {
-					return err
-				}
-				return s.sendCurrentAntonRewardFlowProjection(peer, latest)
-			})
-			if err != nil {
-				s.logGameEvent(peer, "game-raid-dungeon-progress-send-failed", "raid_key", state.RaidKey, "error", err)
-			}
-		}()
+		s.requestCurrentRaidRefresh(identity, state, true)
 	}
 }

@@ -95,6 +95,9 @@ func (s *Service) alignedNativeUpgradeCostResolver() alignedcmd.UpgradeCostResol
 			return result, err
 		}
 		result.Resolved, result.GoldCost = true, cost
+		if mode == "reinforce" {
+			result.NativeGoldCost = cost
+		}
 		// NPC material conversion remains the separately verified reinforce path.
 		if mode == "amplify" || !npcPresent || npcID == math.MaxUint16 {
 			return result, nil
@@ -117,6 +120,7 @@ func (s *Service) alignedNativeUpgradeCostResolver() alignedcmd.UpgradeCostResol
 		}
 		result.GoldCost = 0
 		result.ConversionItemID, result.ConversionCount = materialID, count
+		result.ConversionUnitGold = unitGold
 		return result, nil
 	}
 }
@@ -144,7 +148,7 @@ func (s *Service) candidateUpgradeCostResolver(session *gameSession) alignedcmd.
 					return alignedcmd.UpgradeCostResolution{}, err
 				}
 			}
-			return quote, nil
+			return privateGroupUpgradeGoldQuote(mode, quote), nil
 		}
 	}
 	return nil

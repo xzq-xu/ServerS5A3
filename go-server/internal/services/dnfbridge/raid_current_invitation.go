@@ -95,12 +95,29 @@ func (s *Service) handleCurrentRaidPeerCheck(session *gameSession, op uint16, bo
 	}
 	s.raidMu.Lock()
 	targetRaid := s.runtimeRaidByMemberLocked(target.character)
-	valid := targetRaid == nil && s.currentRaidInvitationPeers(source, target)
+	sourceRaid := s.runtimeRaidByMemberLocked(source.character)
+	var key uint32
+	var leader uint16
+	var members byte
+	valid := s.currentRaidInvitationPeers(source, target)
+	if targetRaid != nil {
+		// This is a read-only menu lookup, not admission. The existing native
+		// cache needs the target's real raid even when the requester is solo.
+		valid = valid && targetRaid.RaidKey != 0 && targetRaid.LeaderID != 0 &&
+			runtimeRaidMemberIndex(*targetRaid, targetRaid.LeaderID) >= 0 &&
+			s.raidPresenceContext(session, *targetRaid, s.accountIDForSession(session))
+		key, leader = targetRaid.RaidKey, targetRaid.LeaderID
+		members = byte(len(targetRaid.Members))
+	} else {
+		// An unassigned target is inviteable only by an actual recruiting
+		// leader. Do not reopen the invite menu for an unassigned requester.
+		valid = valid && s.currentRaidInvitationOpenLocked(sourceRaid, source, target)
+	}
 	s.raidMu.Unlock()
 	if !valid {
 		return s.sendRaidCommandFailure(session, op)
 	}
-	return s.sendGameUpperRawClassCodec(session, op, raid.BuildCurrentUnassignedPeerCheckACK(), 1, true)
+	return s.sendGameUpperRawClassCodec(session, op, raid.BuildCurrentPeerCheckACK(key, leader, members), 1, true)
 }
 func (s *Service) currentRaidInvitationOpenLocked(state *runtimeRaidState, inviter, recipient boundGameSessionCharacter) bool {
 	route, supported := currentRaidRouteForChannel(int(inviter.session.channel.Type))
@@ -202,7 +219,7 @@ func (s *Service) handleCurrentRaidInvitationAcceptance(session *gameSession, op
 	if err := s.sendRuntimeRaidMetadata(session, snapshot, 2); err != nil {
 		return err
 	}
-	if err := s.broadcastRuntimeRaidRefresh(snapshot); err != nil {
+	if err := s.broadcastRuntimeRaidJoinRefresh(snapshot, recipient.character); err != nil {
 		return err
 	}
 	s.logGameEvent(session, "game-current-raid-invitation-accepted", "raid_key", snapshot.RaidKey, "inviter", inviter.character, "recipient", recipient.character, "member_count", len(snapshot.Members), "group_index", placedMember.GroupIndex, "slot_order", placedMember.SlotOrder)

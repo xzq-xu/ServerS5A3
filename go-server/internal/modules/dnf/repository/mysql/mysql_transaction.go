@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"longheng.io/server/internal/modules/dnf/repository"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,13 +16,17 @@ type sqlTxBeginner interface {
 }
 
 type sqlTransactionDB struct {
-	observation *SQLObservation
-	tx          sqlTransaction
-	prepared    *PreparedSQLDB
-	local       *transactionStatements
+	writeVersion *atomic.Uint64
+	observation  *SQLObservation
+	tx           sqlTransaction
+	prepared     *PreparedSQLDB
+	local        *transactionStatements
 }
 
 func (db sqlTransactionDB) rawExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if db.writeVersion != nil {
+		db.writeVersion.Add(1)
+	}
 	s, err := db.preparedStatement(ctx, query)
 	if err != nil {
 		return nil, err
@@ -315,6 +320,7 @@ func (u *mysqlCharacterItemUnitOfWork) WithinCharacterItems(ctx context.Context,
 	txRouter.writeDBs = []string{writeDatabase}
 	txRouter.lockReads = true
 	txGroup := newMySQLGroupFromRouter(txRouter, false)
+	enableInventoryDeltaTracking(txGroup)
 	if err := apply(txGroup.Inventory, txGroup.Equipment); err != nil {
 		return errors.Join(err, rollbackTimedSQLTransaction(ctx, tx))
 	}
@@ -390,12 +396,22 @@ func (u *mysqlCharacterTradeUnitOfWork) withinCharacterInventoryGroup(ctx contex
 	txRouter.writeDBs = append([]string(nil), u.router.writeDBs...)
 	txRouter.lockReads = true
 	txGroup := newMySQLGroupFromRouter(txRouter, false)
+	if len(ids) == 1 {
+		enableInventoryDeltaTracking(txGroup)
+	}
 	allowed := make(map[string]struct{}, len(ids))
 	for _, id := range ids {
 		allowed[id] = struct{}{}
 	}
 	characters := &characterTradeScopedCharacterRepository{allowed: allowed, base: txGroup.Character, activity: txGroup.Activity}
 	inventories := &characterTradeScopedInventoryRepository{allowed: allowed, base: txGroup.Inventory}
+	// Each allowed owner gets its own complete before-image on this same SQL
+	// transaction. Loading the second trader must not replace the first one's
+	// baseline, nor the escrow's baseline in auction operations.
+	inventories.byOwner = make(map[string]repository.InventoryRepository, len(ids))
+	for _, id := range ids {
+		inventories.byOwner[id] = &mysqlBagStore{mysqlStoreBase: mysqlStoreBase{router: txRouter}, trackSlotChanges: true}
+	}
 	var warehouse repository.AccountInventoryRepository
 	if warehouseOwner != "" {
 		warehouse = &characterSettlementAccountInventoryRepository{characterID: warehouseOwner, characters: characters, accounts: txGroup.AccountInventory}
@@ -445,6 +461,14 @@ func (r *characterTradeScopedCharacterRepository) NextNumericID(context.Context)
 type characterTradeScopedInventoryRepository struct {
 	allowed map[string]struct{}
 	base    repository.InventoryRepository
+	byOwner map[string]repository.InventoryRepository
+}
+
+func (r *characterTradeScopedInventoryRepository) ownerStore(id string) repository.InventoryRepository {
+	if store := r.byOwner[strings.TrimSpace(id)]; store != nil {
+		return store
+	}
+	return r.base
 }
 
 func (r *characterTradeScopedInventoryRepository) Load(ctx context.Context, characterID string) (repository.InventoryRecord, bool, error) {
@@ -452,21 +476,21 @@ func (r *characterTradeScopedInventoryRepository) Load(ctx context.Context, char
 	if _, allowed := r.allowed[characterID]; !allowed {
 		return repository.InventoryRecord{}, false, repository.ErrCharacterTradeTransactionUnavailable
 	}
-	return r.base.Load(ctx, characterID)
+	return r.ownerStore(characterID).Load(ctx, characterID)
 }
 
 func (r *characterTradeScopedInventoryRepository) Save(ctx context.Context, record repository.InventoryRecord) error {
 	if _, allowed := r.allowed[strings.TrimSpace(record.CharacterID)]; !allowed {
 		return repository.ErrCharacterTradeTransactionUnavailable
 	}
-	return r.base.Save(ctx, record)
+	return r.ownerStore(record.CharacterID).Save(ctx, record)
 }
 
 func (r *characterTradeScopedInventoryRepository) SaveFields(ctx context.Context, record repository.InventoryRecord, fields ...repository.InventoryField) error {
 	if _, allowed := r.allowed[strings.TrimSpace(record.CharacterID)]; !allowed {
 		return repository.ErrCharacterTradeTransactionUnavailable
 	}
-	return repository.SaveInventoryFields(ctx, r.base, record, fields...)
+	return repository.SaveInventoryFields(ctx, r.ownerStore(record.CharacterID), record, fields...)
 }
 
 func (u *mysqlCharacterAssetUnitOfWork) WithinCharacterAssets(ctx context.Context, characterID string, apply func(repository.CharacterRepository, repository.InventoryRepository, repository.EquipmentRepository) error) error {
@@ -493,6 +517,10 @@ func (u *mysqlCharacterAssetUnitOfWork) WithinCharacterAssets(ctx context.Contex
 	txRouter.writeDBs = []string{writeDatabase}
 	txRouter.lockReads = true
 	txGroup := newMySQLGroupFromRouter(txRouter, false)
+	// Reuse only the complete FOR UPDATE snapshot from this transaction.
+	// Partial/missing snapshots and second saves retain the established fallback.
+	txGroup.Character.(*mysqlCharStore).trackStatChanges = true
+	enableInventoryDeltaTracking(txGroup)
 	// 账本按账号键分库；仍然复用本次物理事务，不能沿用角色单库路由。
 	activityRouter := txRouter
 	activityRouter.readDBs = append([]string(nil), u.router.writeDBs...)
@@ -550,6 +578,7 @@ func (u *mysqlRentalAssetUnitOfWork) WithinRentalAssets(
 	txRouter.writeDBs = append([]string(nil), u.router.writeDBs...)
 	txRouter.lockReads = true
 	txGroup := newMySQLGroupFromRouter(txRouter, false)
+	enableInventoryDeltaTracking(txGroup)
 	// 账本按账号键分库；仍然复用本次物理事务，不能沿用角色单库路由。
 	activityRouter := txRouter
 	activityRouter.readDBs = append([]string(nil), u.router.writeDBs...)
@@ -621,6 +650,7 @@ func (u *mysqlCeraShopAssetUnitOfWork) withinCeraShopSkillAssets(ctx context.Con
 	txRouter.writeDBs = append([]string(nil), u.router.writeDBs...)
 	txRouter.lockReads = true
 	txGroup := newMySQLGroupFromRouter(txRouter, false)
+	enableInventoryDeltaTracking(txGroup)
 	accounts := &rentalScopedAccountRepository{accountID: accountID, base: txGroup.Account}
 	characters := &rentalScopedCharacterRepository{characterID: characterID, base: txGroup.Character}
 	inventories := &rentalScopedInventoryRepository{characterID: characterID, base: txGroup.Inventory}
@@ -790,6 +820,7 @@ func (db sqlTransactionDB) ExecContext(ctx context.Context, q string, args ...an
 		timing.Record(repository.TransactionWrite, time.Since(timedStart), 1)
 	}
 	db.observation.finish(1, sqlObserveExec, start, 0, err)
+	db.observation.finishFamily(sqlObserveExec, start, 0, []sqlFamilyObservation{sqlFamily(q)})
 	return result, err
 }
 func (db sqlTransactionDB) QueryContext(ctx context.Context, q string, args ...any) (SQLRows, error) {
@@ -807,7 +838,7 @@ func (db sqlTransactionDB) QueryContext(ctx context.Context, q string, args ...a
 			rows = timedTransactionRows{SQLRows: rows, timing: timing, phase: phase}
 		}
 	}
-	return observedRows(db.observation, 1, start, rows, err)
+	return observedRows(db.observation, 1, start, rows, err, sqlFamily(q))
 }
 func (db sqlTransactionDB) QueryRowContext(ctx context.Context, q string, args ...any) SQLRow {
 	timing := repository.TransactionTimingFromContext(ctx)
@@ -822,7 +853,7 @@ func (db sqlTransactionDB) QueryRowContext(ctx context.Context, q string, args .
 		timing.Record(phase, time.Since(timedStart), 1)
 		row = timedTransactionRow{SQLRow: row, timing: timing, phase: phase}
 	}
-	return observedRow(db.observation, 1, start, row)
+	return observedRow(db.observation, 1, start, row, sqlFamily(q))
 }
 
 func (r *rentalScopedCharacterRepository) RecordActivity(ctx context.Context, event repository.ActivityEvent) (bool, error) {
@@ -841,4 +872,14 @@ func (r *characterTradeScopedCharacterRepository) RecordActivity(ctx context.Con
 		return false, repository.ErrActivityTransaction
 	}
 	return repository.ScopeCharacterActivity(r.activity, ch).Record(ctx, event)
+}
+
+// A version is shared by all router copies inside one SQL transaction. Any
+// attempted SQL write, including a write through another repository, revokes
+// reusable character snapshots before that write can change the database.
+func (db sqlTransactionDB) transactionWriteVersion() (uint64, bool) {
+	if db.writeVersion == nil {
+		return 0, false
+	}
+	return db.writeVersion.Load(), true
 }

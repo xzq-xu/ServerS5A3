@@ -21,29 +21,46 @@ import (
 )
 
 type gameSession struct {
-	experiencePotionEffects currentExperiencePotionProjection // serial event owner only
-	battlePassBusiness      gameBattlePassState
-	battlePassPush          *gameBattlePassPushState
-	battlePassEntry         gameBattlePassState
-	launcherDiagnostic      *launcherDiagnosticBinding // serial event owner
-	partyDeaths             partyDungeonDeathQueue     // bounded, separately locked delivery mailbox
-	launcherCharacterID     uint16                     // serial event owner; verified selection only
-	launcherCharacterName   string                     // never updated by peer profile reads
+	blackDiamondCoinQueued     atomic.Bool                   // bounded selected-owner delivery event
+	npcShopDiagnostics         currentNPCShopDiagnosticState // separately locked, bounded per connection
+	accountFriendPresence      accountFriendPresenceKey      // guarded by Service.mu
+	accountFriendPresenceReady bool                          // guarded by Service.mu
+	accountFriendRefreshAt     time.Time                     // selected-character event owner
+	accountFriendPendingBody   []byte                        // immutable last successfully sent projection
+	townMoveMu                 sync.Mutex
+	townMoves                  map[townMoveKey]*townMovePending
+	growthTicketPending        *privateGrowthPending // selected-character event owner only
+	// Invalidates initial peer placement without taking another session dungeon lock under the wire lock.
+	dungeonPlacementEpoch     atomic.Uint64
+	peerResultDiagnosticCount uint8                             // serial event owner; bounded observations per connection
+	experiencePotionEffects   currentExperiencePotionProjection // serial event owner only
+	battlePassBusiness        gameBattlePassState
+	battlePassPush            *gameBattlePassPushState
+	battlePassEntry           gameBattlePassState
+	launcherDiagnostic        *launcherDiagnosticBinding // serial event owner
+	partyDeaths               partyDungeonDeathQueue     // bounded, separately locked delivery mailbox
+	launcherCharacterID       uint16                     // serial event owner; verified selection only
+	launcherCharacterName     string                     // never updated by peer profile reads
+	// Only the active Aiken instance may project the private support title's
+	// combat definition. Equipment in durable storage always keeps its neutral ID.
+	aikenSupportTitleActive atomic.Bool
 	// Written and read only by this session's serial event owner.
-	performanceEventQueuedAt            time.Time
-	privateFestivalCommittedSerial      uint64                         // protected by Service.mu; survives character switches
-	dungeonPermissionMigrationAccount   string                         // 只记本会话已完成归并的账号，不缓存权限值。
-	peerProfileSubscription             currentPeerProfileSubscription // protected by Service.mu
-	accountRank                         gameAccountRankState           // 限流和请求号由会话循环访问。
-	battlePassLast                      time.Time                      // 战令预览限流，仅会话循环访问。
-	playerStats                         gamePlayerStatsState           // 请求/缓存只由会话循环使用，busy跨工作协程。
-	professionChangeMu                  sync.Mutex
-	professionChangePending             *currentProfessionChangePending
-	pendingItemExpiryProjection         *currentItemExpiryProjection          // selected-character event loop only
-	fiendWarPendingMove                 *currentFiendWarMovePlan              // 由 townMu / 当前会话事件循环保护。
-	fiendWarAdmissionDiagnosticKey      currentFiendWarAdmissionDiagnosticKey // 由 townMu 保护；只保留最近一次 queue 诊断。
-	fiendWarProjection                  currentFiendWarProjection
-	pvpClientGameType                   uint32 // 本次客户端选择的匹配类型，原子读取与更新。
+	performanceEventQueuedAt          time.Time
+	privateFestivalCommittedSerial    uint64                         // protected by Service.mu; survives character switches
+	dungeonPermissionMigrationAccount string                         // 只记本会话已完成归并的账号，不缓存权限值。
+	peerProfileSubscription           currentPeerProfileSubscription // protected by Service.mu
+	accountRank                       gameAccountRankState           // 限流和请求号由会话循环访问。
+	battlePassLast                    time.Time                      // 战令预览限流，仅会话循环访问。
+	playerStats                       gamePlayerStatsState           // 请求/缓存只由会话循环使用，busy跨工作协程。
+	professionChangeMu                sync.Mutex
+	professionChangePending           *currentProfessionChangePending
+	pendingItemExpiryProjection       *currentItemExpiryProjection          // selected-character event loop only
+	fiendWarPendingMove               *currentFiendWarMovePlan              // 由 townMu / 当前会话事件循环保护。
+	fiendWarAdmissionDiagnosticKey    currentFiendWarAdmissionDiagnosticKey // 由 townMu 保护；只保留最近一次 queue 诊断。
+	fiendWarProjection                currentFiendWarProjection
+	pvpClientGameType                 uint32 // 本次客户端选择的匹配类型，原子读取与更新。
+	// 消耗品召唤源租约（[summon apc]），跨副本运行有效，只由本会话事件循环读写。
+	puppetLease                         *currentDungeonPuppetLease
 	auctionLastSearchOpcode             uint16
 	auctionLastSearchBody               []byte
 	auctionServiceOpenMask              byte
@@ -82,15 +99,16 @@ type gameSession struct {
 	// 取值见 repository_access.go 的 sharedAccountReason* 常量。
 	sharedAccountFallbackReason string
 	// sharedAccountWarnOnce 保证每条会话只写一条"落到共享账号"的 WARN。
-	sharedAccountWarnOnce sync.Once
-	channel               channelcatalog.Channel
-	residentChannel       channelcatalog.Channel
-	coldChannelLanding    *currentColdChannelLanding // 首次选角前的受控频道更正，由会话事件循环保护。
-	packetSeq             uint64
-	goldDiagnosticCount   atomic.Uint32
-	sequence              uint32
-	upperSeq              uint16
-	ctx                   context.Context
+	sharedAccountWarnOnce     sync.Once
+	channel                   channelcatalog.Channel
+	residentChannel           channelcatalog.Channel
+	coldChannelLanding        *currentColdChannelLanding // 首次选角前的受控频道更正，由会话事件循环保护。
+	packetSeq                 uint64
+	goldDiagnosticCount       atomic.Uint32
+	sequence                  uint32
+	upperSeq                  uint16
+	weddingCeremonyProjection currentWeddingCeremonyProjection
+	ctx                       context.Context
 
 	goldDiagnosticSnapshot atomic.Pointer[currentGoldDiagnosticSnapshot]
 
@@ -99,7 +117,8 @@ type gameSession struct {
 	// timer can send concurrently with the connection reader, so callers
 	// must not allocate a sequence before acquiring this lock.
 	wireMu                  sync.Mutex
-	wireWriteContext        context.Context // wireMu; active logical write budget
+	wireWriteContext        context.Context           // wireMu; active logical write budget
+	wireWritePacket         gameWritePacketDiagnostic // wireMu; immediate upper-frame identity only
 	selectTimingMu          sync.Mutex
 	selectTiming            *currentSelectTiming        // selectTimingMu
 	selectLoadingTiming     *currentSelectLoadingTiming // selectTimingMu
@@ -127,6 +146,7 @@ type gameSession struct {
 	events                                  *gameSessionEvents
 	characterGeneration                     uint64
 	raidProjection                          currentRaidProjectionOwner
+	raidRefresh                             currentRaidRefreshQueue
 	selectedCharacterID                     uint16
 	lukeSelectorProgressCharacterID         uint16
 	questManualClearIdentity                boundGameSessionCharacter
@@ -213,6 +233,7 @@ type gameSession struct {
 	// dungeonPeerActorResent 是"副本内队友 actor 补发"的幂等表（键 = 房间 + 地图 + party）。
 	// 只在 session.dungeonPartyRunMu 下读写，见 dungeon_party_peer_actor_resend.go。
 	dungeonPeerActorResent map[dungeonPeerActorResendKey]bool
+	dungeonPeerRecovery    map[dungeonPeerActorResendKey]*dungeonPeerActorRecovery
 	// vendorInjectEmitted 是"厂商登录相位包注入"的每会话幂等表（键 = 注入表行号）。
 	// 只在 session.wireMu 下读写，见 upper_vendor_inject.go。
 	vendorInjectEmitted                  map[int]bool
@@ -302,6 +323,7 @@ type gameSession struct {
 	// pendingPostStartMapMu 保护它（屏障放行发生在另一个会话的 goroutine 上）。
 	// 见 party_dungeon_loading_barrier.go。
 	pendingPostStartMapMu             sync.Mutex
+	partyLoadingPrepared              *partyLoadingPreparation // own session event loop only
 	pendingPostStartMapPlacement      *pendingPostStartMapPlacement
 	deferredDungeonUserStateObjectKey uint16
 	// finishLoadingMu 保护下面三个 finish-loading 门闩。写点全部在所属会话的
@@ -309,6 +331,7 @@ type gameSession struct {
 	// 对端是否已完成场景重建（dungeon_party_peer_actor_landing_resend.go）。
 	// 锁只在赋值/读取那几行内持有，不包网络、仓储或其它锁。
 	finishLoadingMu                    sync.Mutex
+	finishLoadingRevision              uint64
 	currentFinishLoadingStateSent      bool
 	currentFinishLoadingCompletionSent bool
 	postFinishLoadingPlayerStateSent   bool
@@ -435,7 +458,7 @@ type gameSession struct {
 	luckyPreparedCharacter         uint16
 	luckyPreparedGeneration        uint64
 	luckyPreparedActorGeneration   uint64
-	luckyPreparedActive            bool
+	luckyPreparedActive            atomic.Bool
 	luckyFatigueProjection         currentLuckyFatigueProjection
 	portedActivityNextRefresh      time.Time
 	laborDayAnchor                 time.Time
@@ -531,10 +554,11 @@ type townPostTransitionState struct {
 // mu 守护 runtime、runToken 与 deathTower 的全部读写（含定时器回调与
 // handler 路径），原有 dungeonMu 的临界区与锁序惯例保持不变。
 type dungeonSessionState struct {
-	mu         sync.Mutex
-	runtime    *runtimeDungeonState
-	runToken   uint64
-	deathTower *deathTowerRuntime
+	mu              sync.Mutex
+	runtime         *runtimeDungeonState
+	runToken        uint64
+	partyRetirement currentDungeonPartyRetirement
+	deathTower      *deathTowerRuntime
 }
 
 func (s *Service) handleGameConn(ctx context.Context, conn net.Conn) {
@@ -696,7 +720,6 @@ func (s *Service) gameListenPorts(catalog *channelcatalog.Catalog) []int {
 }
 
 func (s *Service) handleGameStreamPacket(session *gameSession, packet dnfproto.LatestGameStreamPacket) error {
-	defer s.afterCurrentLevelUpRewardCommand(session)
 	// 登录路径的 actor 世代重建钩子：布防发生在 type1345 那一包的**派发过程中**，
 	// 所以"派发前已经布防"恰好等价于"这是场景就绪 ack 之后的第一条客户端报文"。
 	// 见 login_actor_generation_rebuild.go。
@@ -781,6 +804,9 @@ func (s *gameSession) setFinishLoadingGateState(value bool) {
 		return
 	}
 	s.finishLoadingMu.Lock()
+	if s.currentFinishLoadingStateSent != value {
+		s.finishLoadingRevision++
+	}
 	s.currentFinishLoadingStateSent = value
 	s.finishLoadingMu.Unlock()
 }
@@ -790,6 +816,9 @@ func (s *gameSession) setFinishLoadingGateCompletion(value bool) {
 		return
 	}
 	s.finishLoadingMu.Lock()
+	if s.currentFinishLoadingCompletionSent != value {
+		s.finishLoadingRevision++
+	}
 	s.currentFinishLoadingCompletionSent = value
 	s.finishLoadingMu.Unlock()
 }
@@ -799,6 +828,9 @@ func (s *gameSession) setFinishLoadingGatePostFinish(value bool) {
 		return
 	}
 	s.finishLoadingMu.Lock()
+	if s.postFinishLoadingPlayerStateSent != value {
+		s.finishLoadingRevision++
+	}
 	s.postFinishLoadingPlayerStateSent = value
 	s.finishLoadingMu.Unlock()
 }
@@ -810,6 +842,9 @@ func (s *gameSession) setFinishLoadingGates(gates finishLoadingGates) {
 		return
 	}
 	s.finishLoadingMu.Lock()
+	if s.currentFinishLoadingStateSent != gates.State || s.currentFinishLoadingCompletionSent != gates.Completion || s.postFinishLoadingPlayerStateSent != gates.PostFinish {
+		s.finishLoadingRevision++
+	}
 	s.currentFinishLoadingStateSent = gates.State
 	s.currentFinishLoadingCompletionSent = gates.Completion
 	s.postFinishLoadingPlayerStateSent = gates.PostFinish

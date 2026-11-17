@@ -352,6 +352,8 @@ type memoryCharacterItemUnitOfWork struct {
 type memoryCharacterTradeUnitOfWork struct {
 	account          *memoryAccountStore
 	activity         *memoryActivityStore
+	mailbox          repository.MailboxRepository
+	quests           repository.QuestRepository
 	settings         repository.SettingsRepository
 	accountInventory repository.AccountInventoryRepository
 	mu               sync.Mutex
@@ -361,13 +363,14 @@ type memoryCharacterTradeUnitOfWork struct {
 }
 
 type memoryCharacterAssetUnitOfWork struct {
-	activity  *memoryActivityStore
-	mu        sync.Mutex
-	sharedMu  *sync.Mutex
-	character repository.CharacterRepository
-	inventory repository.InventoryRepository
-	equipment repository.EquipmentRepository
-	quests    repository.QuestReader
+	levelUpChanges *repository.LevelUpChangeFeed
+	activity       *memoryActivityStore
+	mu             sync.Mutex
+	sharedMu       *sync.Mutex
+	character      repository.CharacterRepository
+	inventory      repository.InventoryRepository
+	equipment      repository.EquipmentRepository
+	quests         repository.QuestReader
 }
 
 func (u *memoryCharacterAssetUnitOfWork) WithinCharacterAssetsAndQuest(ctx context.Context, characterID string, apply func(repository.CharacterRepository, repository.QuestReader) error) error {
@@ -414,10 +417,11 @@ type memoryCharacterSkillUnitOfWork struct {
 }
 
 type memoryCharacterProgressionUnitOfWork struct {
-	mu        sync.Mutex
-	sharedMu  *sync.Mutex
-	character repository.CharacterRepository
-	skills    repository.SkillRepository
+	levelUpChanges *repository.LevelUpChangeFeed
+	mu             sync.Mutex
+	sharedMu       *sync.Mutex
+	character      repository.CharacterRepository
+	skills         repository.SkillRepository
 }
 
 func (u *memoryCharacterSkillUnitOfWork) WithinCharacterSkill(ctx context.Context, characterID string, apply func(repository.SkillRepository) error) error {
@@ -506,7 +510,7 @@ func (u *memoryCharacterProgressionUnitOfWork) WithinCharacterProgression(
 	}
 
 	if characterTx.dirty {
-		if err := u.character.Save(ctx, characterTx.record); err != nil {
+		if err := characterTx.commit(ctx, u.character); err != nil {
 			return errors.Join(err, restoreCharacterRecord(u.character, characterID, character, characterExists, true))
 		}
 	}
@@ -518,6 +522,9 @@ func (u *memoryCharacterProgressionUnitOfWork) WithinCharacterProgression(
 				restoreCharacterRecord(u.character, characterID, character, characterExists, characterTx.dirty),
 			)
 		}
+	}
+	if characterTx.dirty {
+		publishMemoryLevelUpChange(u.levelUpChanges, character, characterTx.record)
 	}
 	return nil
 }
@@ -761,7 +768,7 @@ func (u *memoryCharacterTradeUnitOfWork) withinCharacterInventoryGroup(ctx conte
 			continue
 		}
 		committed = append(committed, committedTradeRecord{characterID: characterID, wallet: true})
-		if err := u.character.Save(ctx, characterTx.records[characterID]); err != nil {
+		if err := characterTx.commit(ctx, u.character, characterID); err != nil {
 			return rollback(err)
 		}
 	}
@@ -792,6 +799,7 @@ type memoryCharacterTradeCharacterTransaction struct {
 	records        map[string]repository.CharacterRecord
 	exists         map[string]bool
 	dirty          map[string]bool
+	weddingDirty   map[string]bool
 }
 
 func (tx *memoryCharacterTradeCharacterTransaction) Load(ctx context.Context, characterID string) (repository.CharacterRecord, bool, error) {
@@ -806,6 +814,10 @@ func (tx *memoryCharacterTradeCharacterTransaction) Load(ctx context.Context, ch
 }
 
 func (tx *memoryCharacterTradeCharacterTransaction) Save(ctx context.Context, record repository.CharacterRecord) error {
+	return tx.SaveFields(ctx, record, repository.CharacterSaveFields(ctx)...)
+}
+
+func (tx *memoryCharacterTradeCharacterTransaction) SaveFields(ctx context.Context, record repository.CharacterRecord, fields ...repository.CharacterField) error {
 	characterID := strings.TrimSpace(record.CharacterID)
 	if err := transactionContextError(ctx); err != nil {
 		return err
@@ -813,7 +825,19 @@ func (tx *memoryCharacterTradeCharacterTransaction) Save(ctx context.Context, re
 	if _, allowed := tx.allowed[characterID]; !allowed {
 		return db.ErrRecordKeyRequired
 	}
-	tx.records[characterID] = repository.CloneCharacter(record)
+	fields = repository.CharacterFields.Normalize(fields)
+	if len(fields) == 0 {
+		return nil
+	}
+	for _, field := range fields {
+		if field == repository.CharacterFieldWedding {
+			if tx.weddingDirty == nil {
+				tx.weddingDirty = make(map[string]bool)
+			}
+			tx.weddingDirty[characterID] = true
+		}
+	}
+	tx.records[characterID] = repository.MergeCharacterFields(tx.records[characterID], record, fields...)
 	tx.exists[characterID] = true
 	tx.dirty[characterID] = true
 	return nil
@@ -913,7 +937,7 @@ func (u *memoryCharacterAssetUnitOfWork) WithinCharacterAssets(ctx context.Conte
 	}
 
 	if characterTx.dirty {
-		if err := u.character.Save(ctx, characterTx.record); err != nil {
+		if err := characterTx.commit(ctx, u.character); err != nil {
 			return errors.Join(err, restoreCharacterRecord(u.character, characterID, character, characterExists, true))
 		}
 	}
@@ -938,6 +962,9 @@ func (u *memoryCharacterAssetUnitOfWork) WithinCharacterAssets(ctx context.Conte
 	}
 	if activityTx != nil {
 		activityTx.commit()
+	}
+	if characterTx.dirty {
+		publishMemoryLevelUpChange(u.levelUpChanges, character, characterTx.record)
 	}
 	return nil
 }
@@ -1007,7 +1034,7 @@ func (u *memoryRentalAssetUnitOfWork) WithinRentalAssets(
 		}
 	}
 	if characterTx.dirty {
-		if err := u.character.Save(ctx, characterTx.record); err != nil {
+		if err := characterTx.commit(ctx, u.character); err != nil {
 			return errors.Join(
 				err,
 				restoreCharacterRecord(u.character, characterID, character, characterExists, true),
@@ -1138,7 +1165,7 @@ func (u *memoryCeraShopAssetUnitOfWork) withinCeraShopSkillAssets(ctx context.Co
 		}
 	}
 	if characterTx.dirty {
-		if err := u.character.Save(ctx, characterTx.record); err != nil {
+		if err := characterTx.commit(ctx, u.character); err != nil {
 			return errors.Join(
 				err,
 				restoreCharacterRecord(u.character, characterID, character, characterExists, true),
@@ -1218,12 +1245,13 @@ func (tx *memoryAccountTransaction) Save(ctx context.Context, record repository.
 }
 
 type memoryCharacterTransaction struct {
-	clear       *moderation.Clear
-	activity    repository.ActivityRepository
-	characterID string
-	record      repository.CharacterRecord
-	exists      bool
-	dirty       bool
+	clear        *moderation.Clear
+	activity     repository.ActivityRepository
+	characterID  string
+	record       repository.CharacterRecord
+	exists       bool
+	dirty        bool
+	weddingDirty bool
 }
 
 type memorySettingsTransaction struct {
@@ -1258,10 +1286,23 @@ func (tx *memoryCharacterTransaction) Load(ctx context.Context, characterID stri
 }
 
 func (tx *memoryCharacterTransaction) Save(ctx context.Context, record repository.CharacterRecord) error {
+	return tx.SaveFields(ctx, record, repository.CharacterSaveFields(ctx)...)
+}
+
+func (tx *memoryCharacterTransaction) SaveFields(ctx context.Context, record repository.CharacterRecord, fields ...repository.CharacterField) error {
 	if err := repository.TransactionKeyError(ctx, tx.characterID, record.CharacterID); err != nil {
 		return err
 	}
-	tx.record = repository.CloneCharacter(record)
+	fields = repository.CharacterFields.Normalize(fields)
+	if len(fields) == 0 {
+		return nil
+	}
+	for _, field := range fields {
+		if field == repository.CharacterFieldWedding {
+			tx.weddingDirty = true
+		}
+	}
+	tx.record = repository.MergeCharacterFields(tx.record, record, fields...)
 	tx.exists = true
 	tx.dirty = true
 	return nil
@@ -1284,7 +1325,7 @@ func restoreCharacterRecord(repo repository.CharacterRepository, characterID str
 		return nil
 	}
 	if existed {
-		return repo.Save(levelUpRollbackContext(), record)
+		return repository.SaveCharacterFields(levelUpRollbackContext(), repo, record, append(repository.AllCharacterFields(), repository.CharacterFieldWedding)...)
 	}
 	deleter, ok := repo.(interface {
 		Delete(context.Context, string) error
@@ -1440,4 +1481,20 @@ func (tx *memoryCharacterTradeCharacterTransaction) RecordActivity(ctx context.C
 		return false, repository.ErrActivityTransaction
 	}
 	return repository.ScopeCharacterActivity(tx.activity, ch).Record(ctx, event)
+}
+
+func publishMemoryLevelUpChange(feed *repository.LevelUpChangeFeed, before, after repository.CharacterRecord) {
+	if feed == nil {
+		return
+	}
+	if before.Level != after.Level {
+		feed.Publish(after.CharacterID)
+		return
+	}
+	for key, value := range after.Stats {
+		if _, ok := repository.LevelUpEventLevel(key); ok && value > 0 && before.Stats[key] != value {
+			feed.Publish(after.CharacterID)
+			return
+		}
+	}
 }

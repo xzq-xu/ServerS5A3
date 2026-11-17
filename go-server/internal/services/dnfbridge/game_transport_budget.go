@@ -7,6 +7,21 @@ import (
 	"time"
 )
 
+// A congested game stream needs more recovery time than a storage operation.
+// Keep this independent of createWriteTimeout: increasing database lock and
+// transaction deadlines would amplify peak-load pressure. The bound still
+// releases a peer that has stopped consuming data entirely.
+const gameTransportWriteTimeout = 30 * time.Second
+
+// Fixed metadata only. Buffered batches and provider controls deliberately
+// have no attributed inner opcode; never guess from encrypted wire bytes.
+type gameWritePacketDiagnostic struct {
+	known      bool
+	class      byte
+	msgID      uint16
+	innerBytes int
+}
+
 // Transport cancellation is separate from the event/transaction lifetime.
 // Retiring an account must still wait for its owner to finish committing.
 func (p *gameSession) gameTransportContext() context.Context {
@@ -43,11 +58,14 @@ func (p *gameSession) closeGameTransport() {
 // Combine explicit caller cancellation, the connection lifetime and the
 // default upper bound. No context here is used to cancel an asset transaction.
 func gameTransportBudget(p *gameSession, parent context.Context) (context.Context, context.CancelFunc) {
+	lifetime := p.gameTransportContext()
+	if parent == nil || parent == context.Background() || parent == lifetime {
+		return context.WithTimeout(lifetime, gameTransportWriteTimeout)
+	}
 	if parent == nil {
 		parent = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(parent, createWriteTimeout)
-	lifetime := p.gameTransportContext()
+	ctx, cancel := context.WithTimeout(parent, gameTransportWriteTimeout)
 	stop := context.AfterFunc(lifetime, cancel)
 	if lifetime.Err() != nil {
 		cancel()
@@ -56,9 +74,19 @@ func gameTransportBudget(p *gameSession, parent context.Context) (context.Contex
 }
 
 func (s *Service) lockGameWire(p *gameSession, parent context.Context) error {
+	if parent != nil && parent.Err() != nil {
+		return parent.Err()
+	}
+	if err := p.gameTransportContext().Err(); err != nil {
+		return err
+	}
+	started := s.performanceStart()
+	if p.wireMu.TryLock() {
+		s.performanceEnd(perfWireLock, started, nil)
+		return nil
+	}
 	ctx, cancel := gameTransportBudget(p, parent)
 	defer cancel()
-	started := s.performanceStart()
 	err := lockCurrentCrossSceneProfile(ctx, &p.wireMu)
 	s.performanceEnd(perfWireLock, started, err)
 	return err
@@ -68,11 +96,19 @@ func (s *Service) lockGameWire(p *gameSession, parent context.Context) error {
 // Nested scopes inherit the earlier deadline and cancellation; on exit the
 // parent is restored. Only the actual write owns a socket deadline/callback.
 func beginGameWriteBudgetLocked(p *gameSession, parent context.Context) (func(), error) {
-	ctx, cancel := gameTransportBudget(p, parent)
 	previous := p.wireWriteContext
+	if previous != nil && (parent == nil || parent.Done() == nil || parent == previous) {
+		if err := previous.Err(); err != nil {
+			return nil, err
+		}
+		return func() {}, nil
+	}
+	ctx, cancel := gameTransportBudget(p, parent)
 	var stop func() bool
 	if previous != nil {
-		if deadline, ok := previous.Deadline(); ok {
+		deadline, ok := previous.Deadline()
+		current, hasDeadline := ctx.Deadline()
+		if ok && (!hasDeadline || deadline.Before(current)) {
 			var childCancel context.CancelFunc
 			ctx, childCancel = context.WithDeadline(ctx, deadline)
 			oldCancel := cancel
@@ -171,8 +207,12 @@ func (s *Service) logFirstGameTransportFailure(p *gameSession, phase string, sta
 				budget = "deadline_exceeded"
 			}
 		}
-		s.logWarn("dnfbridge first game transport failure", "conn_id", p.connID,
+		fields := []any{"conn_id", p.connID,
 			"phase", phase, "write_stage", stage, "planned_bytes", planned,
-			"written_bytes", written, "write_us", elapsed.Microseconds(), "budget_state", budget)
+			"written_bytes", written, "write_us", elapsed.Microseconds(), "budget_state", budget}
+		if packet := p.wireWritePacket; stage == perfWireDirect && packet.known {
+			fields = append(fields, "inner_msg_id", packet.msgID, "inner_class", packet.class, "inner_bytes", packet.innerBytes)
+		}
+		s.logWarn("dnfbridge first game transport failure", fields...)
 	})
 }

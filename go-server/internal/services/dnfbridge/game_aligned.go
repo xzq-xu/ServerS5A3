@@ -51,6 +51,15 @@ var gameAlignedRegistry = alignedcmd.NewRegistry(
 // handleAlignedGameCommand 把协议号已对齐、但尚未落业务实现的命令归入模块边界。
 // 当前只记录分流证据，不伪造成功 ACK；具体回包必须等对应模块按 EXE/日志补齐。
 func (s *Service) handleAlignedGameCommand(session *gameSession, cmd byte, typ uint16, body []byte) (bool, error) {
+	// The current client sends the returnee NPC gift as command=1/type=812.
+	// Keep this exact wire-command guard ahead of every generic asset path so
+	// type 812 remains inert for notice/other command classes.
+	if cmd == byte(dnfenum.GameCmdCommand) && typ == 812 {
+		return true, s.handleCurrentReturneeNPCGift(session, body)
+	}
+	if handled, err := s.handleGrowthTicketOpenMove(session, cmd, typ, body); handled || err != nil {
+		return handled, err
+	}
 	if handled, err := s.handleCurrentContainerUpgradeTicket(session, cmd, typ, body); handled || err != nil {
 		return handled, err
 	}
@@ -349,11 +358,9 @@ func (s *Service) handleAlignedGameCommand(session *gameSession, cmd byte, typ u
 	// 奖励就记一次目标容器。默认 current 档不装记录、不写任何会话字段。
 	// 证据与残余不确定见 box_open_container_refresh.go。
 	magicBoxRewardResolver = s.armBoxOpenContainerRecord(session, magicBoxRewardResolver)
-	// 形状开关 delta 档（默认）下还要装一次"发放前槽位快照"：packageitem 的写入发生在它
-	// 自己的事务里（`internal/modules/dnf/**` 不属于本次改动范围），bridge 只能靠提交前后的
-	// 仓储差分拿到**精确的** (list, slot) 集合，用它替代"回包后 5 个整容器"。
-	// containers 档下一次仓储都不多读。见 item_grant_notice.go。
-	itemGrantSnapshot := s.armItemGrantSnapshot(session, repos, dnfenum.CmdPacket(typ))
+	// Current grant owners report committed slot changes. Older handlers keep
+	// the before/after repository snapshot fallback and the same wire shape.
+	itemGrantSnapshot := s.armItemGrantSnapshotForRegistry(session, repos, dnfenum.CmdPacket(typ), gameAlignedRegistry)
 	premiumContractResolver, premiumCatalogErr := s.alignedPremiumContractResolverForCommand(dnfenum.CmdPacket(typ))
 	if premiumCatalogErr != nil {
 		s.logPacketEvent("game-aligned-premium-resolver-unavailable",
@@ -616,6 +623,7 @@ func (s *Service) handleAlignedGameCommand(session *gameSession, cmd byte, typ u
 			s.logGameEvent(session, "game-guardian-shield-resolver-unavailable", "原因", guardianShieldResolverErr)
 		}
 	}
+	raidEntryCostInventoryBefore := s.captureRuntimeRaidEntryCostInventoryBeforeCommand(session, typ)
 	session.party.mu.Lock()
 	result, ok, err := gameAlignedRegistry.Route(context.Background(), alignedcmd.Request{
 		Command:                      cmd,
@@ -629,6 +637,7 @@ func (s *Service) handleAlignedGameCommand(session *gameSession, cmd byte, typ u
 		EquipmentPlacement:           equipmentPlacement,
 		InventoryItemPlacement:       s.currentInventoryMovePlacement,
 		InventoryCargoInsert:         s.currentInventoryCargoInsert,
+		InventorySortKeys:            s.currentInventorySortKeys,
 		AvatarClassifier:             s.currentCloneAvatarClassifier(),
 		NameTagChecker:               func(itemID uint32) bool { return s.currentIsNameTagItem(itemID) },
 		PetHatchResolver:             petHatchResolver,
@@ -639,6 +648,7 @@ func (s *Service) handleAlignedGameCommand(session *gameSession, cmd byte, typ u
 		UpgradePolicyResolver:        upgradePolicyResolver,
 		GuildMedalUpgradeResolver:    s.currentGuildMedalUpgradeResolver(),
 		UpgradeCostResolver:          s.candidateUpgradeCostResolver(session),
+		UpgradeEquippedBonusResolver: s.alignedUpgradeEquippedBonusResolver(),
 		UpgradeProtectTicketResolver: upgradeProtectTicketResolver,
 		UpgradeRateBuffResolver:      upgradeRateBuffResolver,
 		ForgingResolver:              forgingResolver,
@@ -729,6 +739,8 @@ func (s *Service) handleAlignedGameCommand(session *gameSession, cmd byte, typ u
 			"slot_refreshes", len(result.ItemSlotRefreshes))
 	}
 	s.commitDungeonConsumptionSnapshot(session, consumptionSnapshot, result)
+	// 消耗品召唤源登记（`[summon apc]`）：op44 成功之后才可能产生人偶击杀。
+	s.recordCurrentDungeonPuppetLease(session, typ, result)
 	// delta 档：模块已经把奖励写进库了，这里立刻算差分并把逐槽增量挂到
 	// `result.ItemSlotRefreshes`（`sendAlignedUpperResponses` 会在 ACK 之后无条件发成
 	// class0/msg14），同时把仍需整容器的例外容器记到会话上供后置动作读取。
@@ -824,6 +836,17 @@ func (s *Service) handleAlignedGameCommand(session *gameSession, cmd byte, typ u
 			if typ == uint16(dnfenum.CmdPacketRepairEquipment) {
 				s.logInfo("dnfbridge repair response sent", "conn_id", session.connID,
 					"char_id", session.selectedCharacterID, "responses", len(result.UpperResponses))
+			}
+			if refreshErr := s.refreshRuntimeRaidEntryCostInventoryAfterCommand(session, raidEntryCostInventoryBefore); refreshErr != nil {
+				// The inventory transaction and its ACK/rows have already committed.
+				// A read-only admission refresh failure must not turn that move into
+				// a false client failure; the next inventory change or explicit query
+				// retries from durable state.
+				s.logWarn("dnfbridge raid entry-cost inventory refresh deferred",
+					"conn_id", session.connID,
+					"char_id", session.selectedCharacterID,
+					"operation", result.Operation,
+					"error", refreshErr)
 			}
 			if loginEquipment.planned {
 				s.sendLoginEquipmentNoopSlotRows(session, loginEquipment, "login_wear_noop_after_ack")
@@ -1021,6 +1044,14 @@ func (s *Service) sendAlignedUpperResponses(session *gameSession, result aligned
 		return err
 	}
 	if err := s.sendSelectedIncrementalItemSlotRefreshes(session, result.Operation, result.ItemSlotRefreshes); err != nil {
+		return err
+	}
+	if result.CharacterGoldChanged {
+		if err := s.sendCommittedCharacterGold(session); err != nil {
+			return err
+		}
+	}
+	if err := s.sendCommittedAccountCargoMove(session, result.AccountCargoMove); err != nil {
 		return err
 	}
 	if result.ItemUsageChanged {
@@ -1288,6 +1319,7 @@ func (s *Service) sendAlignedPostAction(session *gameSession, result alignedcmd.
 		}
 		return nil
 	case alignedcmd.PostActionRefreshSelectedPetMoveSlots:
+		defer s.queueCurrentWeddingBenefitsReplay(session, "pet_equipment_move_after_projection")
 		// 宠物/神器穿戴（op19 落点 list 3 槽 26..29）专用的回包后刷新：
 		// 旧口径是 5 个整容器的 class0/op13 全量重发（list 0/1/2/7/38，现场每次
 		// ≈23.9 KB），而落点 list 3 从来不在这份名单里。默认档按厂商

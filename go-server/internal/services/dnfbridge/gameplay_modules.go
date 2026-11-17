@@ -1,6 +1,7 @@
 package dnfbridge
 
 var currentGameplayModules = mustGameplayModuleRegistry(
+	weddingGameplayModule(),
 	chatGameplayModule(),
 	aikenUpgradeGameplayModule(),
 	guildCompoundGameplayModule(),
@@ -10,6 +11,7 @@ var currentGameplayModules = mustGameplayModuleRegistry(
 	pvpGameplayModule(),
 	luckyFatigueGameplayModule(),
 	npcShopGameplayModule(),
+	secretShopGameplayModule(),
 	ceraShopGameplayModule(),
 	ceraPackageGameplayModule(),
 	premiumGameplayModule(),

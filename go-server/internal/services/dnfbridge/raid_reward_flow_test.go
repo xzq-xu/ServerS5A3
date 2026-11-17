@@ -29,6 +29,7 @@ func firstAntonFlowFixture(t *testing.T) (*raidStartGuardFixture, *gameSession, 
 		t.Fatal(err)
 	}
 	f := raidSafetyFixture(t, archive, 2)
+	warmAntonRewardQuestFixture(t, f)
 	ensureRaidRewardAccount(t, f, "account-20")
 	f.service.options.currentClientVersion = "official-24.9"
 	session, peer := f.session(), f.session()
@@ -65,6 +66,7 @@ func firstAntonFlowFixture(t *testing.T) (*raidStartGuardFixture, *gameSession, 
 	// marker when it specifically tests a late or absent natural 659.
 	rewardFlow := f.state.Battle.RewardFlow[0]
 	rewardFlow.PartyShownAt = rewardFlow.CompletedAt.Add(currentAntonMovieWindow(rewardFlow))
+	rewardFlow.PartySelectAfter = map[uint16]time.Time{19: rewardFlow.AutoSelectAt, 20: rewardFlow.AutoSelectAt}
 	return f, session, start.Add(8 * time.Second)
 }
 
@@ -133,7 +135,7 @@ func TestRealPVFAntonAutomaticRewardsLateFailureRetainsPlanAndRollsBack(t *testi
 	original := f.repos.AccountAssets
 	f.repos.AccountAssets = newAntonCardFailLateAssets(original)
 	f.service.repositoryProvider = func() (repo.Group, bool) { return f.repos, true }
-	if _, errs := f.service.advanceCurrentAntonRewardFlows(flow.AutoSelectAt, zeroAntonRoll); len(errs) != 1 || len(flow.Party) != 1 || flow.Party[19].Committed || !flow.SquadShownAt.IsZero() {
+	if _, errs := f.service.advanceCurrentAntonRewardFlows(flow.AutoSelectAt, zeroAntonRoll); len(errs) != 2 || len(flow.Party) != 2 || flow.Party[19].Committed || !flow.SquadShownAt.IsZero() {
 		t.Fatal("failed grant advanced/revealed", errs)
 	}
 	if antonGrantedItemCount(t, f, "19", 10304529) != 0 || antonGrantedItemCount(t, f, "19", 10093974) != 0 {
@@ -287,8 +289,8 @@ func TestRealPVFAntonFinalAutomaticRewardsWaitForOwnedWeeklyCommit(t *testing.T)
 		t.Fatal(err)
 	}
 	body := antonNativeCardBodies(t, f)[3]
-	if len(body) != 26 || body[1] != 2 || binary.LittleEndian.Uint32(body[7:11]) != 10093974 {
-		t.Fatal("current squad body not actual committed two-recipient reward", body)
+	if len(body) < 26 || body[1] != 2 || !r195WantOwners(parsePhase0CardOwners(t, body), 19, 20) || binary.LittleEndian.Uint32(body[7:11]) != 10093974 {
+		t.Fatal("current squad body not actual committed full-team reward", body)
 	}
 	writeAntonNativeCardFixture(t, "go-anton-squad-final.bin", body)
 	f.conn.write.Reset()
@@ -366,7 +368,7 @@ func TestRealPVFAntonFlowRareSquadGrantsContentsAndCurrentNestedDisplay(t *testi
 		t.Fatal(err)
 	}
 	body := antonNativeCardBodies(t, f)[3]
-	if len(body) != 42 || binary.LittleEndian.Uint32(body[7:11]) != 10093974 || binary.LittleEndian.Uint32(body[15:19]) != 100050518 || body[13] != 1 || body[21] != 1 {
+	if len(body) != 42 || binary.LittleEndian.Uint32(body[7:11]) != 10093974 || binary.LittleEndian.Uint32(body[15:19]) != 100050518 || body[13] != 0 || body[21] != 0 {
 		t.Fatal("rare current squad descriptor changed", body)
 	}
 	writeAntonNativeCardFixture(t, "go-anton-squad-rare-first.bin", body)
@@ -384,7 +386,7 @@ func TestRealPVFAntonFlowRareSquadGrantsContentsAndCurrentNestedDisplay(t *testi
 	if err := f.service.sendCurrentAntonRewardFlowProjection(session, cloneRuntimeRaidState(*f.state)); err != nil {
 		t.Fatal(err)
 	}
-	sawBreak, sawTimer, sawReturn := false, false, false
+	sawBreak, sawTimer := false, false
 	stream := f.conn.write.Bytes()
 	for len(stream) > 0 {
 		p, rest := splitGameServerUpperPacket(t, stream)
@@ -397,13 +399,13 @@ func TestRealPVFAntonFlowRareSquadGrantsContentsAndCurrentNestedDisplay(t *testi
 		if p.Header.MsgID == 596 && binary.LittleEndian.Uint32(p.Body[9:13]) == 600 {
 			sawTimer = true
 		}
-		if p.Header.MsgID == 115 && reflect.DeepEqual(p.Body, []byte{0}) {
-			sawReturn = true
+		if p.Header.MsgID == 115 {
+			t.Fatal("reward display replayed boss-death notification", p.Body)
 		}
 		stream = rest
 	}
-	if !sawBreak || !sawTimer || !sawReturn {
-		t.Fatal("finished phase did not restore actual break/owned return", sawBreak, sawTimer, sawReturn)
+	if !sawBreak || !sawTimer {
+		t.Fatal("finished phase did not restore actual break/timer", sawBreak, sawTimer)
 	}
 	// A late movie completion must ACK without covering the standby state.
 	f.conn.write.Reset()

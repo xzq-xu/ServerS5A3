@@ -29,7 +29,7 @@ func TestMySQLPendingLevelUpRecoveryReadsCommittedWriterAndBindsCursor(t *testin
 			t.Fatalf("query lacks %q: %s", part, query.Query)
 		}
 	}
-	if !reflect.DeepEqual(query.Args, []any{len(repository.LevelUpEventStatPrefix), repository.LevelUpEventStatPrefix, "55", 2}) {
+	if !reflect.DeepEqual(query.Args, []any{"level=_up=_event=_%", "55", 2}) {
 		t.Fatalf("bound arguments=%#v", query.Args)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -46,7 +46,9 @@ func TestMySQLLevelUpHistoryIsNotDeletedOrRegressedByOrdinaryStatsReplacement(t 
 		t.Fatal(err)
 	}
 	deleteQuery := database.execs[0]
-	if !strings.Contains(deleteQuery.Query, "AND LEFT(stat_key, ?) <> ? AND LEFT(stat_key, ?) <> ?") || len(deleteQuery.Args) != 5 {
+	if !strings.Contains(deleteQuery.Query, "AND LEFT(stat_key, ?) <> ? AND LEFT(stat_key, ?) <> ?") || len(deleteQuery.Args) != 7 ||
+		deleteQuery.Args[1] != len(repository.LevelUpEventStatPrefix) || deleteQuery.Args[2] != repository.LevelUpEventStatPrefix ||
+		deleteQuery.Args[3] != len(repository.LevelUpRewardStatPrefix) || deleteQuery.Args[4] != repository.LevelUpRewardStatPrefix {
 		t.Fatalf("ordinary replacement erases history=%+v", deleteQuery)
 	}
 	for _, q := range database.execs[1:] {

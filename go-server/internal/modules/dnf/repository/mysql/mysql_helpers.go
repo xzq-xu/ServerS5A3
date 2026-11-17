@@ -16,13 +16,17 @@ import (
 )
 
 type mysqlRouter struct {
-	battlePassChanges *repository.BattlePassChangeFeed
-	db                SQLDB
-	readDBs           []string
-	writeDBs          []string
-	tablePrefix       string
-	now               func() time.Time
-	lockReads         bool
+	storedGuildFingerprint bool
+	levelUpChanges         *repository.LevelUpChangeFeed
+	guildSnapshotNamespace *repository.GuildSnapshotNamespace
+	battlePassChanges      *repository.BattlePassChangeFeed
+	db                     SQLDB
+	readDBs                []string
+	writeDBs               []string
+	tablePrefix            string
+	now                    func() time.Time
+	lockReads              bool
+	consistentRead         bool // physical repeatable-read transaction without write locks
 }
 
 type mysqlStoreBase struct {
@@ -56,12 +60,14 @@ func newMySQLRouter(db SQLDB, options MySQLGroupOptions) (mysqlRouter, error) {
 		now = time.Now
 	}
 	return mysqlRouter{
-		battlePassChanges: repository.NewBattlePassChangeFeed(),
-		db:                db,
-		readDBs:           append([]string(nil), readDBs...),
-		writeDBs:          append([]string(nil), writeDBs...),
-		tablePrefix:       tablePrefix,
-		now:               now,
+		storedGuildFingerprint: options.storedGuildFingerprint,
+		levelUpChanges:         &repository.LevelUpChangeFeed{},
+		battlePassChanges:      repository.NewBattlePassChangeFeed(),
+		db:                     db,
+		readDBs:                append([]string(nil), readDBs...),
+		writeDBs:               append([]string(nil), writeDBs...),
+		tablePrefix:            tablePrefix,
+		now:                    now,
 	}, nil
 }
 

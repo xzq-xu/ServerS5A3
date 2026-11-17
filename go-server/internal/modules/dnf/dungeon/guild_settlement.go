@@ -48,10 +48,18 @@ func readGuildSettlementReceipt(ctx context.Context, settings r.SettingsReposito
 	if receipt.GuildContribution.Points > 0 && (receipt.GuildContribution.GuildID == 0 || (receipt.GuildContribution.Delivery.MailID == "" && receipt.GuildContribution.Delivery.Slot < 0)) {
 		return false, ErrSettlementStateInvalid
 	}
+	if c := receipt.GuildContribution; c.DungeonPoints > c.Points || c.DungeonPoints > receipt.GuildDungeon.Contribution ||
+		(c.DungeonPoints != 0 && c.GuildID != receipt.GuildDungeon.GuildID) {
+		return false, ErrSettlementStateInvalid
+	}
 	result.GuildContribution = receipt.GuildContribution
 	result.GuildContribution.Replayed = true
 	if cmd.GuildDungeon != nil {
 		e := cmd.GuildDungeon.Entry
+		progress := receipt.GuildDungeon.RepeatReward
+		if progress.Progress >= 100 || progress.Display > 100 || (progress.Awarded && (!progress.Enabled || progress.Display != 100)) || (!progress.Awarded && progress.Display != progress.Progress) || (!progress.Enabled && (progress.Progress != 0 || progress.Display != 0)) {
+			return false, ErrSettlementStateInvalid
+		}
 		if receipt.GuildDungeon.GuildID != e.GuildID || receipt.GuildDungeon.DungeonID != e.DungeonID || receipt.GuildDungeon.CycleKey != e.Cycle.Key || receipt.GuildDungeon.Units > e.Cycle.Units {
 			return false, ErrSettlementStateInvalid
 		}

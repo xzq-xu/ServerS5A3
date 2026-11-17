@@ -1,6 +1,7 @@
 package dnfbridge
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -142,29 +143,41 @@ func (s *Service) clearRuntimePartyProjectionForSessions(
 		return
 	}
 	manager := s.runtimePartyManagerForService()
+	guard := func(apply func() error) error { return manager.WithSoloMember(identity.character, apply) }
+	if expectedSnapshotID != 0 {
+		expected, found := manager.SnapshotByUser(identity.character, 0)
+		if !found || expected.ID != expectedSnapshotID || len(expected.Members) > 1 {
+			return
+		}
+		guard = func(apply func() error) error { return manager.WithSnapshot(expected, apply) }
+	}
 	sessions := append([]*gameSession{identity.session}, s.liveSameCharacterSessions(identity.character, identity.session)...)
+	// 等待后仍只能清理本次捕获的辅助连接代际，不能碰重绑后的新缓存。
+	s.mu.Lock()
+	targets := make([]boundGameSessionCharacter, 0, len(sessions))
 	for _, session := range sessions {
-		current := func() bool {
-			// Match bindGameSessionCharacter's s.mu -> party.mu order. The
-			// manager has no callbacks into bridge/session locks.
-			s.mu.Lock()
-			defer s.mu.Unlock()
+		if session != nil {
+			targets = append(targets, boundGameSessionCharacter{session: session, character: identity.character, generation: session.characterGeneration})
+		}
+	}
+	s.mu.Unlock()
+	for _, target := range targets {
+		session := target.session
+		err := s.withCurrentPartyProjectionCommit(guard, &session.party.mu, func() error {
 			if s.gameSessions[identity.character] != identity.session ||
-				identity.session.characterGeneration != identity.generation {
-				return false
+				identity.session.characterGeneration != identity.generation || identity.session.selectedCharacterID != identity.character {
+				return party.ErrRuntimePartyChanged
 			}
-			if session == nil || session.selectedCharacterID != identity.character {
-				return true
+			if session.selectedCharacterID != identity.character || session.characterGeneration != target.generation {
+				return nil
 			}
-			session.party.mu.Lock()
-			defer session.party.mu.Unlock()
-			if !runtimePartyProjectionCleanupCurrent(manager, identity.character, expectedSnapshotID) {
-				return false
+			if session != identity.session && (session.connID == "" || s.liveGameSessions[session.connID] != session) {
+				return nil
 			}
 			session.party.state = alignedcmd.PartyState{}
-			return true
-		}()
-		if !current {
+			return nil
+		})
+		if err != nil {
 			return
 		}
 	}
@@ -733,6 +746,7 @@ func (s *Service) sendChangeHostRuntimePartySnapshots(state alignedcmd.PartyStat
 	if !found {
 		return fmt.Errorf("runtime party %d is no longer current", state.PartyID)
 	}
+	var publicationErrors []error
 	for _, member := range snapshot.Members {
 		identity, online := s.onlineGameSessionCharacterSnapshot(member.UserID)
 		if !online || identity.generation != member.SessionGeneration {
@@ -743,11 +757,16 @@ func (s *Service) sendChangeHostRuntimePartySnapshots(state alignedcmd.PartyStat
 			snapshot.StateFor(member.UserID),
 			"managed_runtime_party_change_host_roster",
 		); err != nil {
-			return err
+			s.logGameEvent(identity.session, "game-party-change-host-publication-error",
+				"party_id", snapshot.ID,
+				"receiver_char_id", member.UserID,
+				"leader_char_id", snapshot.Leader,
+				"error", err.Error())
+			publicationErrors = append(publicationErrors, fmt.Errorf("member %d: %w", member.UserID, err))
 		}
 	}
 	// Dungeon members have no town-area table. Keep the existing complete
 	// dungeon projection (op153 followed by every member's op9 record).
 	s.sendDungeonPartyFrameRoster(state, "managed_runtime_party_change_host_dungeon_roster")
-	return nil
+	return errors.Join(publicationErrors...)
 }

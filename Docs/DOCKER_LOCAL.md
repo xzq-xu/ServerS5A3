@@ -8,12 +8,14 @@ for the server, and matching client/PVF/channel assets supplied separately.
 > [!IMPORTANT]
 > Select the complete external channel table on the first `prepare` call with `--channel-info`. Use the [120-channel deployment guide](CHANNEL_TABLE_DEPLOYMENT.md) to verify the actual loaded table; preserve it when updating the PVF.
 
-For a shareable environment example, see the [Docker runtime reference](DOCKER_RUNTIME_REFERENCE.md)
+For a shareable environment example and the full recommended preset, see the
+[Docker runtime reference](DOCKER_RUNTIME_REFERENCE.md),
+[recommended instance preset](../deploy/templates/docker-instance.recommended.json),
 and [redacted server.env excerpt](../deploy/templates/docker-server.redacted.env).
 They explain the `DNFBRIDGE_GAME_UPPER_*` protocol values, instance-source mapping,
-and a read-only check of the actual game process. Set `dungeon_tournament` to
-`"vendor"` in `instance.json` to enable ordinary and soul tournament opponents;
-the horse-racing activity below remains disabled.
+`dungeon_tournament: "vendor"` (required for 青龙/黄龙/魂大会 opponents), V210–V215+
+display/Buff switches, guild policies, `runtime_compatibility` settings, and a
+read-only check of the actual game process.
 
 ## Activity settings before startup
 
@@ -25,6 +27,13 @@ After `prepare`, set `joust_event_enabled` to `false` in `runtime/docker/instanc
 The [activity table and closing procedure](BUILD_AND_DEPLOY.md#当前活动开关与赛马关闭方法) list all eight managed activities, their source defaults, and the distinction between saved and active settings.
 
 ## Prepare and start
+
+Fresh preparations select and persist the Buff protocol automatically: current
+V212+ clients use grouped Buff synchronization, and the known legacy v56 client
+uses its old protocol when supplied through `--client-dir`. Unknown or missing
+client files require an explicit `--buff-group-sync on|off` choice. A server-only
+fresh install defaults to the current V212+ client. Existing instance settings
+are preserved. See [Buff deployment and client pairing](BUFF_GROUP_DEPLOYMENT.md).
 
 From the repository root on Windows:
 

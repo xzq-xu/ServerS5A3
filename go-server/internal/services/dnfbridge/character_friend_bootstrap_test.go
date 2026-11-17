@@ -9,12 +9,17 @@ import (
 	"longheng.io/server/internal/modules/dnf/dnfenum"
 	proto "longheng.io/server/internal/modules/dnf/protocol"
 	repo "longheng.io/server/internal/modules/dnf/repository"
+	"longheng.io/server/internal/modules/dnf/wedding"
 )
 
 func TestCharacterFriendReselectionRestoresBeforeTownWithoutOp37(t *testing.T) {
 	s, session, repositories := newTownMoveTest(t)
 	s.options.currentClientVersion = "official-24.9"
 	s.adventureGroupTable = loadAdventureGroupTestTables(t)
+	// Initial marriage projection also reads the durable guest-invitation
+	// index for single characters. Supply its rule dependency in this isolated
+	// scene fixture instead of opening an unrelated default Script.pvf path.
+	s.wedding.rules = &wedding.Rules{MinimumLevel: 30, QuestIDs: []int64{20737, 20738}}
 	session.accountID, session.accountFromToken, session.loginPacketSeen = "dnf:1", true, true
 	session.selectedCharacterID = 0
 	ctx := context.Background()
@@ -44,18 +49,18 @@ func TestCharacterFriendReselectionRestoresBeforeTownWithoutOp37(t *testing.T) {
 			if err := s.handleUpperReturnSelectCharacter(session, nil); err != nil {
 				t.Fatal(err)
 			}
+			if session.selectedCharacterID != 0 {
+				t.Fatalf("return selector did not retire previous character: id=%d route=%d stage=%d deferred=%t sceneAck=%t", session.selectedCharacterID, session.initialTownRouteCharacterID, session.initialTownRouteStage, session.sceneBootstrapTailDeferred, session.initialTownLegacySceneReadyAccepted)
+			}
 		}
 		roster, _ := proto.BuildChannelPacket(uint16(dnfenum.UpperMsgCharacterRoster), nil, 0, proto.DefaultChannelClassification)
 		if err := s.handleGameUpper(session, roster); err != nil {
 			t.Fatal(err)
 		}
-		var selected [2]byte
 		conn.write.Reset()
-		binary.LittleEndian.PutUint16(selected[:], 29)
-		selection, _ := proto.BuildChannelPacket(uint16(dnfenum.UpperMsgSelectCharacter), selected[:], 0, proto.DefaultChannelClassification)
-		if err := s.handleGameUpper(session, selection); err != nil {
-			t.Fatal(err)
-		}
+		// Reuse the real roster writer/compact op4 helper. This isolated fixture
+		// has no retained LOGIN-flow cache; do not guess an occupied SQL slot.
+		scope44Select(t, s, session, 29)
 		if err := s.handleDungeonTutorialFlag(session, []byte{currentDungeonTutorialFinalPrefix, 36, 0, 0, 0, currentDungeonTutorialFinalCommit}); err != nil {
 			t.Fatal(err)
 		}
@@ -79,6 +84,11 @@ func TestCharacterFriendReselectionRestoresBeforeTownWithoutOp37(t *testing.T) {
 		}
 		if friendAt < 0 || transitionAt <= friendAt {
 			t.Fatalf("cycle %d: friends=%d town=%d, no client op37 was sent", cycle, friendAt, transitionAt)
+		}
+		// Commit this town scene before asking to return to the selector. The
+		// current client sends legacy 1345 here; this is not a dungeon op37.
+		if err := s.handleLegacyGamePacket(session, buildLegacyTownSceneReadyAckPacket()); err != nil {
+			t.Fatal(err)
 		}
 	}
 }

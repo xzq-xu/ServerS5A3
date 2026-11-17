@@ -51,31 +51,42 @@ type currentRaidProjectionIdentity struct {
 // send from another member's command loop. wireMu still owns socket encoding.
 // Neither mutex is acquired while holding the raid aggregate mutex.
 type currentRaidProjectionOwner struct {
-	mu                     sync.Mutex
-	identity               currentRaidProjectionIdentity
-	version                uint64
-	symbolCursor           uint64
-	timers                 map[raid.AntonTimerKey]raid.AntonTimer
-	mapProjection          currentRaidMapProjection
-	initialized            bool
-	failed                 bool
-	startTransitionSent    bool
-	metadataReadyIdentity  currentRaidProjectionIdentity
-	metadataReady          bool
-	sessionRestorePending  bool
-	resultIdentity         currentRaidProjectionIdentity
-	resultSent             bool
-	movieIdentity          currentRaidProjectionIdentity
-	moviePromptSent        bool
-	movieCompleted         bool
-	rewardScreenIdentity   currentRaidProjectionIdentity
-	rewardScreenSent       bool
-	rewardFlowIdentity     currentRaidProjectionIdentity
-	rewardFlowSignature    [32]byte
-	rewardDisplayIdentity  currentRaidProjectionIdentity
-	rewardDisplaySignature [32]byte
-	participation          map[uint16]currentRaidParticipationPosition
-	clearEvents            map[currentRaidClearEvent]struct{}
+	mu                          sync.Mutex
+	identity                    currentRaidProjectionIdentity
+	version                     uint64
+	symbolCursor                uint64
+	timers                      map[raid.AntonTimerKey]raid.AntonTimer
+	mapProjection               currentRaidMapProjection
+	initialized                 bool
+	failed                      bool
+	startTransitionSent         bool
+	metadataReadyIdentity       currentRaidProjectionIdentity
+	metadataReady               bool
+	sessionRestorePending       bool
+	resultIdentity              currentRaidProjectionIdentity
+	resultSent                  bool
+	failureResultAt             time.Time
+	movieIdentity               currentRaidProjectionIdentity
+	moviePromptSent             bool
+	moviePromptAt               time.Time
+	movieCompleted              bool
+	rewardScreenIdentity        currentRaidProjectionIdentity
+	rewardScreenSent            bool
+	rewardFlowIdentity          currentRaidProjectionIdentity
+	rewardFlowSignature         [32]byte
+	rewardDisplayIdentity       currentRaidProjectionIdentity
+	rewardDisplaySignature      [32]byte
+	rewardListIdentity          currentRaidProjectionIdentity
+	rewardListSignatures        [4][32]byte
+	rewardDisplayShownAt        time.Time
+	rewardSquadDisplayIdentity  currentRaidProjectionIdentity
+	rewardSquadDisplaySignature [32]byte
+	rewardSquadDisplayShownAt   time.Time
+	singleAntonReturnAt         time.Time
+	singleAntonReturnTimer      *time.Timer
+	participation               map[uint16]currentRaidParticipationPosition
+	clearEvents                 map[currentRaidClearEvent]struct{}
+	memberClearCounts           map[uint16]byte
 }
 
 type currentRaidProjectionPacket struct {
@@ -84,17 +95,16 @@ type currentRaidProjectionPacket struct {
 	symbolCursor uint64
 }
 
-// Native v157 585 -> 01A65320 -> the current Luke controller vtbl+0x18
-// (01111F20) enqueues dstr30207 "已通关%s 地下城。" whenever a row's NEW state
+// Native 585 -> 01A65320 -> the current controller vtbl+0x18 (Anton
+// 01878400, Luke 01111F20) enqueues dstr30207 whenever a row's NEW state
 // is 3; the old state is never compared. b.Dungeons keeps state 3 for the whole
 // phase after a dungeon is finished, so re-publishing the full map on every
 // ProgressVersion bump repeats that prompt. 585 carries a variable row list, so
 // publish only rows whose state changed; a first subscription, a reconnect and
 // a new projection identity still get the complete snapshot.
 //
-// Only Luke (Mode 2) is switched to the row delta. The native state-3 prompt is
-// proven for the Luke controller vtable; Anton/FiendWar keep the historical
-// full-map behaviour until their own consumers are proven equivalent.
+// Anton and Luke share this edge-triggered consumer. FiendWar has its own
+// projection owner and does not inherit their row delta.
 type currentRaidMapProjection struct {
 	rows      map[uint32]byte
 	infection uint32
@@ -105,7 +115,7 @@ type currentRaidMapProjection struct {
 // packets returns the 585 frames this projection must publish and the cache to
 // commit only after the whole batch reached the socket.
 func (c currentRaidMapProjection) packets(mode byte, resubscribe bool, identity currentRaidProjectionIdentity, rows []raid.DungeonState, infection uint32, fullBody []byte) ([]currentRaidProjectionPacket, currentRaidMapProjection, error) {
-	full := mode != 2 || resubscribe || !c.valid || c.identity != identity
+	full := (mode != 1 && mode != 2) || resubscribe || !c.valid || c.identity != identity
 	delta, cache := currentRaidMapRowDelta(c.rows, rows)
 	next := currentRaidMapProjection{rows: cache, infection: infection, identity: identity, valid: true}
 	if full {
@@ -388,6 +398,17 @@ func (s *Service) sendCurrentRaidProgressProjectionLocked(session *gameSession, 
 	}
 	participationPackets, clearEvents := currentRaidParticipationProjection(o.participation, nextParticipation, fresh, previousClearEvents)
 	packets = append(packets, participationPackets...)
+	memberClearCounts := currentRaidMemberClearCounters(state)
+	if !sameCurrentRaidMemberClearCounters(o.memberClearCounts, memberClearCounts) {
+		// Accepted clears change the table's Field56 independently of map/584
+		// positions. Push it now instead of waiting for a manual info request,
+		// new member or manager action to rebuild the roster.
+		body, err := s.buildRuntimeRaidRosterBody(state)
+		if err != nil {
+			return err
+		}
+		packets = append(packets, currentRaidProjectionPacket{opcode: raid.RaidMemberRefreshMsgID, body: body})
+	}
 	for _, packet := range packets {
 		if err := s.sendGameUpperRawClassCodec(session, packet.opcode, packet.body, 0, true); err != nil {
 			o.failed = true
@@ -403,6 +424,7 @@ func (s *Service) sendCurrentRaidProgressProjectionLocked(session *gameSession, 
 		}
 	}
 	o.participation, o.clearEvents = nextParticipation, clearEvents
+	o.memberClearCounts = memberClearCounts
 	o.mapProjection = nextMapProjection
 	o.identity, o.version, o.symbolCursor, o.timers, o.initialized = identity, b.ProgressVersion, cursor, nextTimers, true
 	if b.Mode == 2 && !b.Single && b.FiendWar == nil && (initial || resubscribe) {

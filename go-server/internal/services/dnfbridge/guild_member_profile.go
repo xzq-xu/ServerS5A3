@@ -62,16 +62,16 @@ func (s *Service) loadCurrentGuildMemberProfileAccess(ctx context.Context, viewe
 	if !s.currentGuildMemberProfileIdentities(access) {
 		return access, dnfguild.ErrNotMember
 	}
-	_, reg, err := s.loadCurrentGuildRegistry(ctx)
+	_, reg, err := s.readCurrentGuildDirectory(ctx)
 	if err != nil {
 		return access, err
 	}
-	vg, vm, vok := reg.GuildForOwner(dnfrepo.GuildOwner{CharacterID: strconv.Itoa(int(v.character)), AccountID: access.viewerAccount})
-	ag, am, aok := reg.GuildForOwner(dnfrepo.GuildOwner{CharacterID: strconv.Itoa(int(a.character)), AccountID: access.actorAccount})
-	if !vok || !aok || vg.ID == 0 || vg.ID != ag.ID {
+	vm, vok := reg.OwnedMember(dnfrepo.GuildOwner{CharacterID: strconv.Itoa(int(v.character)), AccountID: access.viewerAccount})
+	am, aok := reg.OwnedMember(dnfrepo.GuildOwner{CharacterID: strconv.Itoa(int(a.character)), AccountID: access.actorAccount})
+	if !vok || !aok || vm.GuildID == 0 || vm.GuildID != am.GuildID {
 		return access, dnfguild.ErrNotMember
 	}
-	access.guildID, access.viewerJoined, access.actorJoined = vg.ID, vm.JoinedAt, am.JoinedAt
+	access.guildID, access.viewerJoined, access.actorJoined = vm.GuildID, vm.JoinedAt, am.JoinedAt
 	_, err = s.validateCurrentGuildMemberProfileAccess(ctx, access)
 	return access, err
 }
@@ -105,7 +105,7 @@ func (s *Service) validateCurrentGuildMemberProfileAccess(ctx context.Context, a
 			actor = c
 		}
 	}
-	_, reg, err := s.loadCurrentGuildRegistry(ctx)
+	_, reg, err := s.readCurrentGuildDirectory(ctx)
 	if err != nil {
 		return dnfrepo.CharacterRecord{}, err
 	}
@@ -114,8 +114,8 @@ func (s *Service) validateCurrentGuildMemberProfileAccess(ctx context.Context, a
 		if i == 1 {
 			account, joined = a.actorAccount, a.actorJoined
 		}
-		g, m, found := reg.GuildForOwner(dnfrepo.GuildOwner{CharacterID: strconv.Itoa(int(identity.character)), AccountID: account})
-		if !found || g.ID != a.guildID || !m.JoinedAt.Equal(joined) {
+		m, found := reg.OwnedMember(dnfrepo.GuildOwner{CharacterID: strconv.Itoa(int(identity.character)), AccountID: account})
+		if !found || m.GuildID != a.guildID || !m.JoinedAt.Equal(joined) {
 			return dnfrepo.CharacterRecord{}, dnfguild.ErrNotMember
 		}
 	}
@@ -165,6 +165,12 @@ type currentGuildMemberProfileFrame struct {
 }
 
 func (s *Service) sendCurrentGuildMemberProfile(ctx context.Context, a currentGuildMemberProfileAccess) error {
+	return s.sendCurrentGuildMemberProfileWithPolicy(ctx, a, false)
+}
+
+// cacheOnly sends the existing silent mode8 cache projection. It does not
+// send the separate mode3 inspection request or create a visible scene actor.
+func (s *Service) sendCurrentGuildMemberProfileWithPolicy(ctx context.Context, a currentGuildMemberProfileAccess, cacheOnly bool) error {
 	c, err := s.validateCurrentGuildMemberProfileAccess(ctx, a)
 	if err != nil {
 		return nil
@@ -198,6 +204,9 @@ func (s *Service) sendCurrentGuildMemberProfile(ctx context.Context, a currentGu
 			return err
 		}
 		frames = []currentGuildMemberProfileFrame{{2, 0, priming}, {2, 0, mode3}}
+		if cacheOnly {
+			frames = frames[:1]
+		}
 	}
 	return s.sendCurrentGuildMemberProfileFrames(ctx, a, revision, frames)
 }

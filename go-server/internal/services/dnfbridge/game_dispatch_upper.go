@@ -18,7 +18,9 @@ func (s *Service) handleGameUpper(session *gameSession, raw []byte) (resultErr e
 	if packet.Header.MsgID == 39 {
 		stage = perfUpper39
 	}
-	defer func() { s.performanceEnd(stage, started, resultErr) }()
+	defer func() {
+		s.performanceUpperEnd(stage, packet.Header.MsgID, packet.Header.Classification, started, resultErr)
+	}()
 	if s.gmEditProtectionEnabled() && !session.accountFromToken {
 		if packet.Header.MsgID != 1 || packet.Header.Classification != dnfproto.DefaultChannelClassification {
 			return errPlayerAuthentication
@@ -36,6 +38,12 @@ func (s *Service) handleGameUpper(session *gameSession, raw []byte) (resultErr e
 	requestSequence := session.guild.purchaseSequence.observe(packet.Header.Seq)
 	if packet.Header.MsgID == privateActivityOpcode {
 		return s.handlePrivateActivity(session, packet.Header.Classification, packet.Body)
+	}
+	if packet.Header.MsgID == privateClientFeaturesOpcode {
+		return s.handlePrivateClientFeatures(session, packet.Header.Classification, packet.Body)
+	}
+	if packet.Header.MsgID == privateGrowthOpcode {
+		return s.handlePrivateGrowth(session, packet.Header.Classification, packet.Body)
 	}
 	if packet.Header.MsgID == privateFestivalOpcode {
 		return s.handlePrivateFestival(session, packet.Header.Classification, packet.Body)
